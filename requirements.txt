@@ -1,0 +1,7 @@
+scenedetect[opencv]==0.6.5
+imagehash==4.3.2
+opencv-python-headless==4.10.0.84
+Pillow==11.1.0
+oss2==2.19.1
+requests==2.32.3
+PyYAML==6.0.2

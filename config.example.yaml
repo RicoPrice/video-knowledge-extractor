@@ -1,0 +1,28 @@
+# 阿里云 OSS 配置
+oss:
+  access_key_id: "your-access-key-id"
+  access_key_secret: "your-access-key-secret"
+  endpoint: "https://oss-cn-shanghai.aliyuncs.com"
+  bucket: "your-bucket-name"
+  prefix: "video-knowledge/"
+
+# 阿里云百炼 API（Paraformer ASR + Qwen-VL）
+dashscope:
+  api_key: "your-dashscope-api-key"
+
+# DeepSeek API
+deepseek:
+  api_key: "your-deepseek-api-key"
+  base_url: "https://api.deepseek.com"
+
+# Dify Workflow API
+dify:
+  base_url: "http://localhost/v1"
+  api_key: "your-dify-workflow-api-key"
+
+# 预处理参数
+preprocess:
+  scene_threshold: 3.0
+  phash_threshold: 5
+  audio_sample_rate: 16000
+  min_scene_duration: 1.0
