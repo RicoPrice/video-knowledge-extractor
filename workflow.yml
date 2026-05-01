@@ -1,0 +1,82 @@
+app:
+  description: "视频知识提取工作流"
+  icon: "\U0001F3AC"
+  icon_background: "#2B0E44"
+  mode: workflow
+  name: "视频知识提取 Video Knowledge Extractor"
+  use_icon_as_answer_icon: false
+kind: app
+version: 0.1.5
+workflow:
+  conversation_variables: []
+  environment_variables:
+    - description: "DashScope API Key"
+      id: env-dashscope-key
+      name: DASHSCOPE_API_KEY
+      value_type: secret
+      value: ""
+    - description: "DeepSeek API Key"
+      id: env-deepseek-key
+      name: DEEPSEEK_API_KEY
+      value_type: secret
+      value: ""
+  features: {}
+  graph:
+    edges:
+      - id: e1
+        source: start
+        target: parse_manifest
+        sourceHandle: source
+        targetHandle: target
+      - id: e2
+        source: parse_manifest
+        target: asr_request
+        sourceHandle: source
+        targetHandle: target
+      - id: e3
+        source: asr_request
+        target: semantic_segment
+        sourceHandle: source
+        targetHandle: target
+      - id: e4
+        source: semantic_segment
+        target: visual_analysis
+        sourceHandle: source
+        targetHandle: target
+      - id: e5
+        source: visual_analysis
+        target: timestamp_align
+        sourceHandle: source
+        targetHandle: target
+      - id: e6
+        source: timestamp_align
+        target: denoise
+        sourceHandle: source
+        targetHandle: target
+      - id: e7
+        source: denoise
+        target: knowledge_extract
+        sourceHandle: source
+        targetHandle: target
+      - id: e8
+        source: knowledge_extract
+        target: dedup_aggregate
+        sourceHandle: source
+        targetHandle: target
+      - id: e9
+        source: dedup_aggregate
+        target: final_polish
+        sourceHandle: source
+        targetHandle: target
+      - id: e10
+        source: final_polish
+        target: multi_format_output
+        sourceHandle: source
+        targetHandle: target
+      - id: e11
+        source: multi_format_output
+        target: end
+        sourceHandle: source
+        targetHandle: target
+    nodes: []
+  hash: "video-knowledge-extractor-v1"
