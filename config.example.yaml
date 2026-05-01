@@ -26,3 +26,8 @@ preprocess:
   phash_threshold: 5
   audio_sample_rate: 16000
   min_scene_duration: 1.0
+
+# Web App 配置
+web:
+  host: "0.0.0.0"
+  port: 7860

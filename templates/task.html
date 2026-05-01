@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ task.video_name }} — 报告</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+  .prose h1 { font-size: 1.5rem; font-weight: 700; margin: 1.5rem 0 0.75rem; }
+  .prose h2 { font-size: 1.25rem; font-weight: 600; margin: 1.25rem 0 0.5rem; }
+  .prose h3 { font-size: 1.1rem; font-weight: 600; margin: 1rem 0 0.5rem; }
+  .prose p { margin: 0.5rem 0; line-height: 1.7; }
+  .prose ul, .prose ol { margin: 0.5rem 0; padding-left: 1.5rem; }
+  .prose li { margin: 0.25rem 0; }
+  .prose table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+  .prose th, .prose td { border: 1px solid #e5e7eb; padding: 0.5rem 0.75rem; text-align: left; }
+  .prose th { background: #f9fafb; font-weight: 600; }
+  .prose blockquote { border-left: 3px solid #d1d5db; padding-left: 1rem; color: #6b7280; margin: 1rem 0; }
+  .prose code { background: #f3f4f6; padding: 0.15rem 0.4rem; border-radius: 0.25rem; font-size: 0.875rem; }
+  .prose pre { background: #1f2937; color: #e5e7eb; padding: 1rem; border-radius: 0.5rem; overflow-x: auto; }
+  .prose pre code { background: none; padding: 0; color: inherit; }
+  .tab-active { border-bottom: 2px solid #6366f1; color: #4338ca; }
+</style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+
+<nav class="bg-white border-b px-6 py-3 flex items-center gap-4">
+  <a href="/" class="text-gray-400 hover:text-gray-600 text-sm">&larr; 返回</a>
+  <h1 class="text-base font-semibold text-gray-800">{{ task.video_name }}</h1>
+</nav>
+
+<main class="max-w-4xl mx-auto px-4 py-6">
+
+  <!-- Info bar -->
+  <div class="flex items-center justify-between mb-6">
+    <div class="text-sm text-gray-500">
+      创建于 {{ task.created_at[:19] }}
+    </div>
+    <div class="flex gap-2">
+      {% if task.report_markdown %}
+      <a href="/api/tasks/{{ task.id }}/download/md" class="px-3 py-1.5 bg-indigo-500 text-white text-xs rounded-lg hover:bg-indigo-600">下载 Markdown</a>
+      {% endif %}
+      {% if task.report_json %}
+      <a href="/api/tasks/{{ task.id }}/download/json" class="px-3 py-1.5 bg-gray-100 text-gray-700 text-xs rounded-lg hover:bg-gray-200">下载 JSON</a>
+      {% endif %}
+      {% if task.report_srt %}
+      <a href="/api/tasks/{{ task.id }}/download/srt" class="px-3 py-1.5 bg-gray-100 text-gray-700 text-xs rounded-lg hover:bg-gray-200">下载 SRT</a>
+      {% endif %}
+      {% if task.report_html %}
+      <a href="/api/tasks/{{ task.id }}/download/html" class="px-3 py-1.5 bg-gray-100 text-gray-700 text-xs rounded-lg hover:bg-gray-200">下载 HTML</a>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="flex gap-6 border-b mb-6">
+    <button onclick="showTab('preview')" id="tab-preview" class="pb-2 text-sm font-medium tab-active">预览</button>
+    <button onclick="showTab('raw')" id="tab-raw" class="pb-2 text-sm font-medium text-gray-400 hover:text-gray-600">原始 Markdown</button>
+    {% if task.report_json %}
+    <button onclick="showTab('json')" id="tab-json" class="pb-2 text-sm font-medium text-gray-400 hover:text-gray-600">JSON</button>
+    {% endif %}
+    {% if task.manifest_json %}
+    <button onclick="showTab('manifest')" id="tab-manifest" class="pb-2 text-sm font-medium text-gray-400 hover:text-gray-600">Manifest</button>
+    {% endif %}
+  </div>
+
+  <!-- Content -->
+  <div id="content-preview" class="prose max-w-none"></div>
+  <pre id="content-raw" class="hidden bg-gray-900 text-gray-100 p-4 rounded-lg text-sm overflow-auto max-h-[70vh]"></pre>
+  <pre id="content-json" class="hidden bg-gray-900 text-gray-100 p-4 rounded-lg text-sm overflow-auto max-h-[70vh]"></pre>
+  <pre id="content-manifest" class="hidden bg-gray-900 text-gray-100 p-4 rounded-lg text-sm overflow-auto max-h-[70vh]"></pre>
+
+</main>
+
+<script>
+const md = {{ task.report_markdown | tojson }};
+const rj = {{ task.report_json | tojson }};
+const manifest = {{ task.manifest_json | tojson }};
+
+document.getElementById('content-preview').innerHTML = marked.parse(md || '*报告尚未生成*');
+document.getElementById('content-raw').textContent = md || '';
+document.getElementById('content-json').textContent = rj ? JSON.stringify(JSON.parse(rj), null, 2) : '';
+document.getElementById('content-manifest').textContent = manifest ? JSON.stringify(JSON.parse(manifest), null, 2) : '';
+
+function showTab(name) {
+  ['preview','raw','json','manifest'].forEach(t => {
+    const el = document.getElementById('content-' + t);
+    const tab = document.getElementById('tab-' + t);
+    if (el) el.classList.toggle('hidden', t !== name);
+    if (tab) { tab.classList.toggle('tab-active', t === name); tab.classList.toggle('text-gray-400', t !== name); }
+  });
+}
+</script>
+</body>
+</html>
