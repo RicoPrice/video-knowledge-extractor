@@ -63,26 +63,36 @@ async def transcribe_audio(audio_path: str, api_key: str) -> dict:
         from dashscope.audio.asr import Transcription
         dashscope.api_key = api_key
 
-        # Step 1: 用 SDK 上传文件到 DashScope
-        log.info("上传音频到 DashScope: %s (%.1fMB)", upload_path, os.path.getsize(upload_path) / 1024 / 1024)
-        upload_resp = await asyncio.to_thread(
-            dashscope.Files.upload, upload_path, "file-extract"
-        )
-        if upload_resp.status_code != 200:
-            raise RuntimeError(f"音频上传失败: HTTP {upload_resp.status_code} {upload_resp}")
-        uploaded = upload_resp.output.get("uploaded_files", [])
-        if not uploaded:
-            failed = upload_resp.output.get("failed_uploads", [])
-            raise RuntimeError(f"音频上传失败: {failed}")
-        file_id = uploaded[0]["file_id"]
-        file_url = f"fileid://{file_id}"
-        log.info("音频已上传: %s", file_url)
+        # Step 1: 上传 MP3 到阿里云 OSS，生成签名 URL
+        import oss2
+        oss_cfg = _load_config().get("oss", {})
+        oss_ak = oss_cfg.get("access_key_id", "")
+        oss_sk = oss_cfg.get("access_key_secret", "")
+        oss_endpoint = oss_cfg.get("endpoint", "")
+        oss_bucket_name = oss_cfg.get("bucket", "")
+        oss_prefix = oss_cfg.get("prefix", "video-knowledge/")
+
+        if not all([oss_ak, oss_sk, oss_endpoint, oss_bucket_name]):
+            raise RuntimeError("OSS 未配置，请在 config.yaml 中填写 oss.access_key_id/secret/endpoint/bucket")
+
+        auth = oss2.Auth(oss_ak, oss_sk)
+        bucket = oss2.Bucket(auth, oss_endpoint, oss_bucket_name)
+
+        oss_key = f"{oss_prefix}{os.path.basename(upload_path)}"
+        file_size_mb = os.path.getsize(upload_path) / 1024 / 1024
+        log.info("上传音频到 OSS: %s (%.1fMB) -> %s", upload_path, file_size_mb, oss_key)
+
+        await asyncio.to_thread(bucket.put_object_from_file, oss_key, upload_path)
+
+        # 生成 1 小时有效的签名 URL
+        signed_url = bucket.sign_url('GET', oss_key, 3600)
+        log.info("OSS 签名 URL: %s", signed_url[:80])
 
         # Step 2: 提交异步转写任务
         task_response = await asyncio.to_thread(
             Transcription.async_call,
             model="paraformer-v2",
-            file_urls=[file_url],
+            file_urls=[signed_url],
             language_hints=["zh", "en"],
         )
 
@@ -93,7 +103,7 @@ async def transcribe_audio(audio_path: str, api_key: str) -> dict:
             raise RuntimeError(f"ASR 提交失败: {task_response}")
         log.info("ASR 任务已提交: %s", task_id)
 
-        # Step 3: 用 SDK 的 wait 方法等待结果
+        # Step 3: 等待结果
         result = await asyncio.to_thread(Transcription.wait, task=task_id)
         if not hasattr(result, "output") or not result.output:
             raise RuntimeError(f"ASR 返回无效结果: {result}")
@@ -124,6 +134,14 @@ async def transcribe_audio(audio_path: str, api_key: str) -> dict:
 
         full_text = "\n".join(full_text_parts)
         log.info("ASR 完成: %d 段, %d 字", len(segments), len(full_text))
+
+        # 清理 OSS 临时文件
+        try:
+            await asyncio.to_thread(bucket.delete_object, oss_key)
+            log.info("已清理 OSS 临时文件: %s", oss_key)
+        except Exception:
+            pass
+
         return {"text": full_text, "segments": segments}
 
     finally:
