@@ -210,66 +210,83 @@ async def extract_knowledge(
     video_name: str, deepseek_key: str, deepseek_url: str = "https://api.deepseek.com",
 ) -> dict:
     """
-    调用 DeepSeek 融合音频+视觉信息，提取结构化知识点。
-    返回 {"knowledge_points": [...], "summary": "..."}
+    调用 DeepSeek 融合音频+视觉信息，提取教学级知识点。
+    返回 {"knowledge_points": [...], "summary": "...", "outline": [...]}
     """
     log.info("知识点提取: DeepSeek")
 
     # 构建视觉内容摘要
     visual_summary = []
     for vr in visual_results:
-        line = f"[{vr['timestamp']:.1f}s] {vr.get('visual_type','?')}"
+        line = f"[{vr['timestamp']:.1f}s] 类型={vr.get('visual_type','?')}"
         if vr.get("text_content"):
-            line += f" | 文字: {vr['text_content'][:200]}"
+            line += f"\n  画面文字: {vr['text_content'][:300]}"
         if vr.get("description"):
-            line += f" | {vr['description'][:100]}"
+            line += f"\n  描述: {vr['description'][:200]}"
         visual_summary.append(line)
 
     # 构建转写文本（带时间戳）
     transcript_lines = []
-    for seg in transcript.get("segments", [])[:200]:  # 限制长度
+    for seg in transcript.get("segments", [])[:300]:
         transcript_lines.append(f"[{seg['start']:.1f}s-{seg['end']:.1f}s] {seg['text']}")
 
-    prompt = f"""你是一个专业的知识点提取专家。请根据以下视频录播的音频转写和画面分析，提取结构化的知识点。
+    prompt = f"""你是一位资深技术讲师和知识整理专家。你的任务是将一段技术直播/录播的内容整理成**可以直接用来学习的教学笔记**，而不是简单的内容摘要。
 
 ## 视频名称
 {video_name}
 
 ## 音频转写（带时间戳）
-{chr(10).join(transcript_lines[:150])}
-{"... (更多内容省略)" if len(transcript_lines) > 150 else ""}
+{chr(10).join(transcript_lines[:250])}
+{"... (更多内容省略)" if len(transcript_lines) > 250 else ""}
 
-## 画面分析（关键帧）
+## 画面分析（关键帧截图内容）
 {chr(10).join(visual_summary)}
 
-## 要求
-请提取出所有重要知识点，每个知识点包含：
-1. title: 简洁的标题
-2. content: 详细说明（2-5句话）
-3. time_range: 大致时间范围
-4. importance: high/medium/low
-5. related_visual: 相关的画面内容（如有）
+## 输出要求
 
-同时生成一个整体摘要（summary），200字以内。
+请输出以下 JSON 结构：
 
-请用以下 JSON 格式输出：
 ```json
 {{
-  "summary": "整体摘要",
+  "summary": "200-300字的整体内容概述，说明这个视频讲了什么主题、适合什么水平的学习者",
+  "outline": ["章节1标题", "章节2标题", ...],
   "knowledge_points": [
     {{
-      "title": "...",
-      "content": "...",
-      "time_range": "0:00-2:30",
-      "importance": "high",
-      "related_visual": "..."
+      "title": "知识点标题",
+      "chapter": "所属章节标题",
+      "time_range": "起始时间-结束时间（如 5:30-12:00）",
+      "start_seconds": 330,
+      "keyframe_timestamps": [5.0, 45.2, 120.0],
+      "content": "详细的教学内容，要求如下...",
+      "key_takeaways": ["要点1", "要点2", "要点3"],
+      "code_snippets": ["如果画面或讲解中有代码，提取到这里"],
+      "importance": "high/medium/low"
     }}
   ]
 }}
 ```
+
+### content 字段的要求（最重要）：
+- **不是摘要**，而是**教学笔记**。读者应该能通过阅读 content 学到这个知识点
+- 每个知识点的 content 至少 200-500 字
+- 包含：概念解释、原理说明、使用场景、注意事项
+- 如果讲师举了例子，把例子也写进去
+- 如果涉及代码，在 code_snippets 中给出代码
+- 如果涉及步骤操作，用编号列表写清楚每一步
+- 用 Markdown 格式（可以用 **加粗**、`代码`、列表等）
+
+### keyframe_timestamps 字段：
+- 从画面分析中找出与该知识点最相关的截图时间戳（秒）
+- 这些时间戳会用来在报告中嵌入对应的截图
+
+### 其他要求：
+- 知识点按时间顺序排列
+- 合并重复内容，但不要遗漏重要信息
+- 如果讲师反复强调某个点，在 key_takeaways 中标注
+
 只返回 JSON，不要其他内容。"""
 
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         resp = await client.post(
             f"{deepseek_url}/v1/chat/completions",
             headers={
@@ -279,7 +296,7 @@ async def extract_knowledge(
             json={
                 "model": "deepseek-chat",
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 4096,
+                "max_tokens": 8192,
                 "temperature": 0.3,
             },
         )
@@ -289,7 +306,7 @@ async def extract_knowledge(
     try:
         result = json.loads(answer.strip().strip("```json").strip("```").strip())
     except json.JSONDecodeError:
-        result = {"summary": answer[:500], "knowledge_points": []}
+        result = {"summary": answer[:500], "knowledge_points": [], "outline": []}
 
     log.info("知识点提取完成: %d 个知识点", len(result.get("knowledge_points", [])))
     return result
@@ -297,20 +314,103 @@ async def extract_knowledge(
 
 # ── Multi-format Output ───────────────────────────
 
-def generate_markdown(video_name: str, knowledge: dict) -> str:
-    lines = [f"# {video_name} — 知识点报告\n"]
+def generate_markdown(video_name: str, knowledge: dict, keyframes: list[dict] = None, video_url: str = "") -> str:
+    """生成带截图和视频片段的教学级 Markdown 报告"""
+    keyframes = keyframes or []
+    # 建立时间戳 → 关键帧文件路径的索引
+    kf_by_ts = {}
+    for kf in keyframes:
+        kf_by_ts[round(kf.get("timestamp", -1), 1)] = kf
+
+    lines = [f"# {video_name} — 知识点笔记\n"]
+
     if knowledge.get("summary"):
-        lines.append(f"## 摘要\n\n{knowledge['summary']}\n")
-    lines.append("## 知识点\n")
-    for i, kp in enumerate(knowledge.get("knowledge_points", []), 1):
-        imp = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(kp.get("importance", ""), "⚪")
-        lines.append(f"### {i}. {kp['title']} {imp}\n")
-        lines.append(f"**时间**: {kp.get('time_range', '未知')}\n")
-        lines.append(f"{kp['content']}\n")
-        if kp.get("related_visual"):
-            lines.append(f"> 📷 画面: {kp['related_visual']}\n")
+        lines.append(f"## 📋 概述\n\n{knowledge['summary']}\n")
+
+    # 目录
+    outline = knowledge.get("outline", [])
+    if outline:
+        lines.append("## 📑 目录\n")
+        for i, ch in enumerate(outline, 1):
+            lines.append(f"{i}. {ch}")
         lines.append("")
+
+    # 按章节分组
+    current_chapter = ""
+    for i, kp in enumerate(knowledge.get("knowledge_points", []), 1):
+        chapter = kp.get("chapter", "")
+        if chapter and chapter != current_chapter:
+            current_chapter = chapter
+            lines.append(f"\n---\n\n## {chapter}\n")
+
+        imp = {"high": "🔴 重要", "medium": "🟡 一般", "low": "🟢 了解"}.get(kp.get("importance", ""), "")
+        time_range = kp.get("time_range", "")
+        lines.append(f"### {i}. {kp['title']}\n")
+
+        # 时间戳 + 视频跳转链接
+        meta_parts = []
+        if time_range:
+            start_sec = kp.get("start_seconds", 0)
+            if video_url and start_sec:
+                meta_parts.append(f"⏱ [{time_range}]({video_url}#t={start_sec})")
+            else:
+                meta_parts.append(f"⏱ {time_range}")
+        if imp:
+            meta_parts.append(imp)
+        if meta_parts:
+            lines.append(f"{'  |  '.join(meta_parts)}\n")
+
+        # 正文内容
+        lines.append(f"{kp['content']}\n")
+
+        # 要点总结
+        takeaways = kp.get("key_takeaways", [])
+        if takeaways:
+            lines.append("**💡 要点：**\n")
+            for t in takeaways:
+                lines.append(f"- {t}")
+            lines.append("")
+
+        # 代码片段
+        snippets = kp.get("code_snippets", [])
+        for snippet in snippets:
+            if snippet.strip():
+                lines.append(f"```\n{snippet}\n```\n")
+
+        # 嵌入关键帧截图
+        kf_timestamps = kp.get("keyframe_timestamps", [])
+        embedded = False
+        for ts in kf_timestamps:
+            ts_r = round(float(ts), 1)
+            # 精确匹配或找最近的帧（±2秒）
+            matched_kf = kf_by_ts.get(ts_r)
+            if not matched_kf:
+                for kf_ts, kf_data in kf_by_ts.items():
+                    if abs(kf_ts - ts_r) <= 2.0:
+                        matched_kf = kf_data
+                        break
+            if matched_kf:
+                fname = matched_kf.get("filename", "")
+                if fname:
+                    lines.append(f"![截图 {ts_r}s](keyframes/{fname})\n")
+                    embedded = True
+        if not embedded and kf_timestamps:
+            # 没匹配到精确帧，用最近的
+            for ts in kf_timestamps[:1]:
+                closest = _find_closest_keyframe(float(ts), keyframes)
+                if closest:
+                    lines.append(f"![截图 {ts}s](keyframes/{closest.get('filename', '')})\n")
+
+        lines.append("")
+
     return "\n".join(lines)
+
+
+def _find_closest_keyframe(target_ts: float, keyframes: list[dict]) -> dict | None:
+    """找到时间戳最接近的关键帧"""
+    if not keyframes:
+        return None
+    return min(keyframes, key=lambda kf: abs(kf.get("timestamp", 0) - target_ts))
 
 
 def generate_json_report(video_name: str, knowledge: dict) -> str:
@@ -416,7 +516,7 @@ async def run_ai_pipeline(manifest_path: str, progress_cb=None) -> dict:
     if progress_cb:
         await progress_cb("生成报告", 95)
 
-    md = generate_markdown(video_name, knowledge)
+    md = generate_markdown(video_name, knowledge, keyframes=keyframes)
     rj = generate_json_report(video_name, knowledge)
     srt = generate_srt(knowledge)
 
