@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{{ task.video_name }} — 报告</title>
 <script src="https://cdn.tailwindcss.com"></script>
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <style>
   .prose h1 { font-size: 1.5rem; font-weight: 700; margin: 1.5rem 0 0.75rem; color: #1f2937; }
   .prose h2 { font-size: 1.25rem; font-weight: 600; margin: 1.5rem 0 0.5rem; color: #374151; }
@@ -29,6 +29,7 @@
     margin: 0.75rem 0;
     box-shadow: 0 1px 3px rgba(0,0,0,0.1);
     cursor: pointer;
+    display: block;
   }
   .prose img:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
   .prose strong { color: #1f2937; }
@@ -66,9 +67,7 @@
 
   <!-- Info bar -->
   <div class="flex items-center justify-between mb-6">
-    <div class="text-sm text-gray-500">
-      创建于 {{ task.created_at[:19] }}
-    </div>
+    <div class="text-sm text-gray-500">创建于 {{ task.created_at[:19] }}</div>
     <div class="flex gap-2">
       {% if task.report_markdown %}
       <a href="/api/tasks/{{ task.id }}/download/md" class="px-3 py-1.5 bg-indigo-500 text-white text-xs rounded-lg hover:bg-indigo-600">下载 Markdown</a>
@@ -103,59 +102,64 @@
 </main>
 
 <script>
-const md = {{ task.report_markdown | tojson }};
-const rj = {{ task.report_json | tojson }};
-const manifest = {{ task.manifest_json | tojson }};
-const hasVideo = !!document.getElementById('vid');
+var md = {{ task.report_markdown | tojson }};
+var rj = {{ task.report_json | tojson }};
+var manifest = {{ task.manifest_json | tojson }};
+var hasVideo = !!document.getElementById('vid');
 
-// Custom renderer
-const renderer = new marked.Renderer();
+// Step 1: Parse markdown normally (let marked handle everything except images)
+marked.setOptions({ breaks: true });
+var rawMd = md || '*报告尚未生成*';
+var html = marked.parse(rawMd);
 
-// Images: clickable lightbox
-renderer.image = function({href, title, text}) {
-  return `<img src="${href}" alt="${text || ''}" title="${title || text || ''}" loading="lazy"
-    onclick="document.getElementById('lightbox-img').src=this.src; document.getElementById('lightbox').classList.add('active')"
-    onerror="this.style.display='none'">`;
-};
+// Step 2: Fix images — marked v12+ may output <img> or may leave ![alt](url) as text
+// Replace any remaining ![alt](url) patterns in the rendered HTML
+html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function(match, alt, src) {
+  return '<img src="' + src + '" alt="' + alt + '" title="' + alt + '" loading="lazy" class="report-img">';
+});
 
-// Convert ⏱️ timestamps to clickable links that seek the video
-const origParagraph = renderer.paragraph;
-renderer.paragraph = function({text, tokens}) {
-  let html = typeof text === 'string' ? text : this.parser.parseInline(tokens);
-  if (hasVideo) {
-    // Match patterns like ⏱️ **1:23 - 4:56** or **0:00:12 - 0:05:30**
-    html = html.replace(/(\d{1,2}:\d{2}(?::\d{2})?)\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?)/g, (match, start, end) => {
-      const startSec = tsToSec(start);
-      const endSec = tsToSec(end);
-      return `<span class="ts-link" onclick="seekTo(${startSec})" title="跳转到 ${start}">${start}</span> - <span class="ts-link" onclick="seekTo(${endSec})" title="跳转到 ${end}">${end}</span>`;
-    });
-  }
-  return `<p>${html}</p>\n`;
-};
+// Step 3: Make timestamps clickable
+if (hasVideo) {
+  html = html.replace(/(\d{1,2}:\d{2}(?::\d{2})?)\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?)/g, function(match, start, end) {
+    var ss = tsToSec(start), es = tsToSec(end);
+    return '<span class="ts-link" onclick="seekTo(' + ss + ')" title="跳转到 ' + start + '">' + start + '</span>'
+      + ' - <span class="ts-link" onclick="seekTo(' + es + ')" title="跳转到 ' + end + '">' + end + '</span>';
+  });
+}
 
-marked.setOptions({ renderer: renderer, breaks: true });
+// Step 4: Render
+document.getElementById('content-preview').innerHTML = html;
 
-document.getElementById('content-preview').innerHTML = marked.parse(md || '*报告尚未生成*');
-document.getElementById('content-raw').textContent = md || '';
+// Step 5: Attach lightbox click handlers to all images
+document.querySelectorAll('.prose img').forEach(function(img) {
+  img.addEventListener('click', function() {
+    document.getElementById('lightbox-img').src = this.src;
+    document.getElementById('lightbox').classList.add('active');
+  });
+  img.addEventListener('error', function() { this.style.display = 'none'; });
+});
+
+// Other tabs
+document.getElementById('content-raw').textContent = {{ task.report_markdown | tojson }} || '';
 try { document.getElementById('content-json').textContent = rj ? JSON.stringify(JSON.parse(rj), null, 2) : ''; } catch(e) { document.getElementById('content-json').textContent = rj || ''; }
 try { document.getElementById('content-manifest').textContent = manifest ? JSON.stringify(JSON.parse(manifest), null, 2) : ''; } catch(e) { document.getElementById('content-manifest').textContent = manifest || ''; }
 
 function tsToSec(ts) {
-  const parts = ts.split(':').map(Number);
+  var parts = ts.split(':').map(Number);
   if (parts.length === 3) return parts[0]*3600 + parts[1]*60 + parts[2];
   if (parts.length === 2) return parts[0]*60 + parts[1];
   return 0;
 }
 
 function seekTo(sec) {
-  const vid = document.getElementById('vid');
+  var vid = document.getElementById('vid');
   if (vid) { vid.currentTime = sec; vid.play(); vid.scrollIntoView({behavior:'smooth', block:'start'}); }
 }
 
 function showTab(name) {
-  ['preview','raw','json','manifest'].forEach(t => {
-    const el = document.getElementById('content-' + t);
-    const tab = document.getElementById('tab-' + t);
+  ['preview','raw','json','manifest'].forEach(function(t) {
+    var el = document.getElementById('content-' + t);
+    var tab = document.getElementById('tab-' + t);
     if (el) el.classList.toggle('hidden', t !== name);
     if (tab) { tab.classList.toggle('tab-active', t === name); tab.classList.toggle('text-gray-400', t !== name); }
   });
