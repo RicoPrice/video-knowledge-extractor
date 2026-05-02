@@ -108,60 +108,75 @@ async def transcribe_audio(audio_path: str, api_key: str) -> dict:
 async def analyze_keyframes(keyframes: list[dict], api_key: str) -> list[dict]:
     """
     调用 Qwen-VL-Max 分析关键帧图片。
-    每张图片返回 {"index", "timestamp", "visual_type", "text_content", "description"}
+    最多分析 MAX_FRAMES 张（均匀采样），5 路并发。
     """
-    log.info("视觉分析: %d 张关键帧", len(keyframes))
+    MAX_FRAMES = 30
+    CONCURRENCY = 5
+
+    # 均匀采样
+    if len(keyframes) > MAX_FRAMES:
+        step = len(keyframes) / MAX_FRAMES
+        sampled = [keyframes[int(i * step)] for i in range(MAX_FRAMES)]
+        log.info("视觉分析: 从 %d 张中采样 %d 张", len(keyframes), len(sampled))
+    else:
+        sampled = keyframes
+        log.info("视觉分析: %d 张关键帧", len(sampled))
+
+    sem = asyncio.Semaphore(CONCURRENCY)
     results = []
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        for kf in keyframes:
-            filepath = kf.get("filepath", "")
-            if not filepath or not os.path.exists(filepath):
-                continue
+    async def analyze_one(kf: dict) -> dict | None:
+        filepath = kf.get("filepath", "")
+        if not filepath or not os.path.exists(filepath):
+            return None
 
-            # 读取图片并 base64 编码
-            with open(filepath, "rb") as f:
-                img_b64 = base64.b64encode(f.read()).decode()
+        with open(filepath, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
 
-            resp = await client.post(
-                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "qwen-vl-max",
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                            {"type": "text", "text": (
-                                "分析这张视频截图，用 JSON 格式回答：\n"
-                                '{"is_ppt": true/false, "visual_type": "ppt|code|chart|camera|other", '
-                                '"text_content": "图片中的文字内容", '
-                                '"description": "一句话描述画面内容"}\n'
-                                "只返回 JSON，不要其他内容。"
-                            )},
-                        ],
-                    }],
-                    "max_tokens": 500,
-                },
-            )
-            resp.raise_for_status()
-            answer = resp.json()["choices"][0]["message"]["content"]
+        async with sem:
+            async with httpx.AsyncClient(timeout=60) as client:
+                try:
+                    resp = await client.post(
+                        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": "qwen-vl-max",
+                            "messages": [{
+                                "role": "user",
+                                "content": [
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                                    {"type": "text", "text": (
+                                        "分析这张视频截图，用 JSON 格式回答：\n"
+                                        '{"is_ppt": true/false, "visual_type": "ppt|code|chart|camera|other", '
+                                        '"text_content": "图片中的文字内容", '
+                                        '"description": "一句话描述画面内容"}\n'
+                                        "只返回 JSON，不要其他内容。"
+                                    )},
+                                ],
+                            }],
+                            "max_tokens": 500,
+                        },
+                    )
+                    resp.raise_for_status()
+                    answer = resp.json()["choices"][0]["message"]["content"]
+                except Exception as e:
+                    log.warning("  帧 %d 分析失败: %s", kf.get("index", 0), e)
+                    return None
 
-            # 尝试解析 JSON
-            try:
-                parsed = json.loads(answer.strip().strip("```json").strip("```").strip())
-            except json.JSONDecodeError:
-                parsed = {"is_ppt": False, "visual_type": "other", "text_content": "", "description": answer[:200]}
+        try:
+            parsed = json.loads(answer.strip().strip("```json").strip("```").strip())
+        except json.JSONDecodeError:
+            parsed = {"is_ppt": False, "visual_type": "other", "text_content": "", "description": answer[:200]}
 
-            results.append({
-                "index": kf.get("index", 0),
-                "timestamp": kf.get("timestamp", 0),
-                **parsed,
-            })
-            log.info("  帧 %d (%.1fs): %s", kf.get("index", 0), kf.get("timestamp", 0), parsed.get("visual_type", "?"))
+        log.info("  帧 %d (%.1fs): %s", kf.get("index", 0), kf.get("timestamp", 0), parsed.get("visual_type", "?"))
+        return {"index": kf.get("index", 0), "timestamp": kf.get("timestamp", 0), **parsed}
+
+    tasks = [analyze_one(kf) for kf in sampled]
+    raw = await asyncio.gather(*tasks)
+    results = [r for r in raw if r is not None]
 
     log.info("视觉分析完成: %d 张", len(results))
     return results
