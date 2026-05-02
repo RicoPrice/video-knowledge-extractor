@@ -158,18 +158,46 @@ async def transcribe_audio(audio_path: str, api_key: str) -> dict:
 async def analyze_keyframes(keyframes: list[dict], api_key: str) -> list[dict]:
     """
     调用 Qwen-VL-Max 分析关键帧图片。
-    最多分析 MAX_FRAMES 张（均匀采样），5 路并发。
+    先用 pHash 去重，再均匀采样最多 MAX_FRAMES 张，5 路并发。
     """
     MAX_FRAMES = 30
     CONCURRENCY = 5
+    PHASH_THRESHOLD = 8  # pHash 汉明距离阈值，越小越严格
 
-    # 均匀采样
-    if len(keyframes) > MAX_FRAMES:
-        step = len(keyframes) / MAX_FRAMES
-        sampled = [keyframes[int(i * step)] for i in range(MAX_FRAMES)]
-        log.info("视觉分析: 从 %d 张中采样 %d 张", len(keyframes), len(sampled))
+    # Step 1: pHash 去重 — 过滤掉相似帧
+    try:
+        import imagehash
+        from PIL import Image
+        deduped = []
+        seen_hashes = []
+        for kf in keyframes:
+            fp = kf.get("filepath", "")
+            if not fp or not os.path.exists(fp):
+                continue
+            try:
+                h = imagehash.phash(Image.open(fp))
+                is_dup = False
+                for sh in seen_hashes:
+                    if abs(h - sh) < PHASH_THRESHOLD:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    deduped.append(kf)
+                    seen_hashes.append(h)
+            except Exception:
+                deduped.append(kf)  # 无法计算 hash 的帧保留
+        log.info("pHash 去重: %d → %d 张", len(keyframes), len(deduped))
+    except ImportError:
+        log.warning("imagehash 未安装，跳过 pHash 去重")
+        deduped = [kf for kf in keyframes if kf.get("filepath") and os.path.exists(kf.get("filepath", ""))]
+
+    # Step 2: 均匀采样
+    if len(deduped) > MAX_FRAMES:
+        step = len(deduped) / MAX_FRAMES
+        sampled = [deduped[int(i * step)] for i in range(MAX_FRAMES)]
+        log.info("视觉分析: 从 %d 张中采样 %d 张", len(deduped), len(sampled))
     else:
-        sampled = keyframes
+        sampled = deduped
         log.info("视觉分析: %d 张关键帧", len(sampled))
 
     sem = asyncio.Semaphore(CONCURRENCY)
@@ -486,90 +514,73 @@ async def run_ai_pipeline(manifest_path: str, progress_cb=None) -> dict:
         if not kf.get("filepath"):
             kf["filepath"] = os.path.join(manifest_dir, "keyframes", kf.get("filename", ""))
 
-    # Step 1: ASR
+    errors = []  # 收集每一步的错误
+
+    # Step 1: ASR — 必须成功，否则报错
     transcript = {"text": "", "segments": []}
-    if ds_key and ds_key != "your-dashscope-api-key" and audio_path and os.path.exists(audio_path):
+    if not ds_key or ds_key == "your-dashscope-api-key":
+        errors.append("❌ ASR 失败: DashScope API Key 未配置")
+    elif not audio_path or not os.path.exists(audio_path):
+        errors.append(f"❌ ASR 失败: 音频文件不存在 ({audio_path})")
+    else:
         if progress_cb:
             await progress_cb("ASR 语音转写", 50)
         try:
             transcript = await transcribe_audio(audio_path, ds_key)
+            if not transcript.get("text", "").strip():
+                errors.append("⚠️ ASR 返回空文本，可能是音频无语音内容或转写服务异常")
+            else:
+                log.info("ASR 成功: %d 字, %d 段", len(transcript["text"]), len(transcript.get("segments", [])))
         except Exception as e:
-            log.error("ASR 失败: %s", e)
-    else:
-        log.warning("跳过 ASR: DashScope API Key 未配置或音频不存在")
+            errors.append(f"❌ ASR 失败: {e}")
 
-    # Step 2: Visual Analysis
+    # Step 2: Visual Analysis — 失败记录但不阻断
     visual_results = []
-    if ds_key and ds_key != "your-dashscope-api-key" and keyframes:
+    if not ds_key or ds_key == "your-dashscope-api-key":
+        errors.append("❌ 视觉分析失败: DashScope API Key 未配置")
+    elif not keyframes:
+        errors.append("⚠️ 视觉分析跳过: 无关键帧")
+    else:
         if progress_cb:
             await progress_cb("视觉分析 (Qwen-VL)", 65)
         try:
             visual_results = await analyze_keyframes(keyframes, ds_key)
+            log.info("视觉分析成功: %d 张", len(visual_results))
         except Exception as e:
-            log.error("视觉分析失败: %s", e)
-    else:
-        log.warning("跳过视觉分析: DashScope API Key 未配置或无关键帧")
+            errors.append(f"❌ 视觉分析失败: {e}")
 
-    # Step 3: Knowledge Extraction
-    knowledge = {"summary": "", "knowledge_points": []}
-    if dk_key and dk_key != "your-deepseek-api-key":
+    # Step 3: Knowledge Extraction — 必须有 ASR 文本才能提取
+    knowledge = {"summary": "", "knowledge_points": [], "outline": []}
+    if not dk_key or dk_key == "your-deepseek-api-key":
+        errors.append("❌ 知识点提取失败: DeepSeek API Key 未配置")
+    elif not transcript.get("text", "").strip():
+        errors.append("❌ 知识点提取跳过: 没有 ASR 转写文本，无法提取知识点（请先修复 ASR 问题）")
+    else:
         if progress_cb:
             await progress_cb("知识点提取 (DeepSeek)", 80)
         try:
             knowledge = await extract_knowledge(transcript, visual_results, video_name, dk_key, dk_url)
+            if not knowledge.get("knowledge_points"):
+                errors.append("⚠️ DeepSeek 未返回任何知识点")
+            else:
+                log.info("知识点提取成功: %d 个", len(knowledge["knowledge_points"]))
         except Exception as e:
-            log.error("知识点提取失败: %s", e)
-    else:
-        log.warning("跳过知识点提取: DeepSeek API Key 未配置")
+            errors.append(f"❌ 知识点提取失败: {e}")
 
-    # Step 4: 如果没有 AI 结果，生成基础报告
-    if not knowledge.get("knowledge_points"):
-        knowledge = _fallback_report(manifest, transcript, visual_results)
-
-    # Step 5: Multi-format output
+    # Step 4: 生成报告 — 如果有错误，在报告开头显示
     if progress_cb:
         await progress_cb("生成报告", 95)
 
-    md = generate_markdown(video_name, knowledge, visual_results, keyframes)
-    rj = generate_json_report(video_name, knowledge)
+    if errors:
+        error_block = "## ⚠️ 处理过程中遇到以下问题\n\n"
+        for err in errors:
+            error_block += f"- {err}\n"
+        error_block += "\n请检查以上问题后重新上传视频。\n\n---\n\n"
+    else:
+        error_block = ""
+
+    md = error_block + generate_markdown(video_name, knowledge, visual_results, keyframes)
+    rj = generate_json_report(video_name, {**knowledge, "errors": errors})
     srt = generate_srt(knowledge)
 
     return {"markdown": md, "json": rj, "srt": srt}
-
-
-def _fallback_report(manifest: dict, transcript: dict, visual_results: list) -> dict:
-    """API Key 未配置时的降级报告"""
-    kps = []
-    if transcript.get("segments"):
-        kps.append({
-            "title": "音频转写结果",
-            "content": transcript["text"][:500] + ("..." if len(transcript["text"]) > 500 else ""),
-            "time_start_sec": 0,
-            "time_end_sec": 0,
-            "importance": "high",
-            "related_frame_indices": [],
-            "key_takeaways": [],
-        })
-    for vr in visual_results[:10]:
-        kps.append({
-            "title": f"画面内容 ({vr['timestamp']:.1f}s)",
-            "content": vr.get("description", "") or vr.get("text_content", ""),
-            "time_start_sec": vr.get("timestamp", 0),
-            "time_end_sec": vr.get("timestamp", 0),
-            "importance": "medium",
-            "related_frame_indices": [vr.get("index", 0)],
-            "key_takeaways": [],
-        })
-    stats = manifest.get("stats", {})
-    summary = f"视频共检测到 {stats.get('total_scenes', 0)} 个场景，其中 PPT 帧 {stats.get('ppt_frames', 0)} 张。"
-    if not kps:
-        kps.append({
-            "title": "预处理完成",
-            "content": summary + " API Key 未配置，无法进行 AI 分析。请在 config.yaml 中填入 DashScope 和 DeepSeek 的 API Key。",
-            "time_start_sec": 0,
-            "time_end_sec": 0,
-            "importance": "high",
-            "related_frame_indices": [],
-            "key_takeaways": [],
-        })
-    return {"summary": summary, "knowledge_points": kps, "outline": []}
