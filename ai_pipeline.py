@@ -30,6 +30,7 @@ def _load_config() -> dict:
 async def transcribe_audio(audio_path: str, api_key: str) -> dict:
     """
     调用阿里云百炼 Paraformer-v2 进行语音转写。
+    使用 DashScope 官方 SDK，自动处理文件上传。
     大 WAV 文件先压缩成 MP3 再上传。
     返回 {"text": "全文", "segments": [{"start": 0.0, "end": 1.5, "text": "..."}]}
     """
@@ -58,75 +59,48 @@ async def transcribe_audio(audio_path: str, api_key: str) -> dict:
             tmp_mp3 = None
 
     try:
-        # Step 1: 上传音频文件到 DashScope
-        log.info("上传音频到 DashScope: %s", upload_path)
-        mime = "audio/mpeg" if upload_path.endswith(".mp3") else "audio/wav"
-        async with httpx.AsyncClient(timeout=600) as client:
-            with open(upload_path, "rb") as f:
-                resp = await client.post(
-                    "https://dashscope.aliyuncs.com/api/v1/uploads",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    files={"file": (os.path.basename(upload_path), f, mime)},
-                    data={"purpose": "file-extract"},
-                )
-            resp.raise_for_status()
-            upload_data = resp.json()
-            file_url = upload_data.get("data", {}).get("uploaded_url", "")
-            if not file_url:
-                file_id = upload_data.get("data", {}).get("file_id") or upload_data.get("id", "")
-                file_url = f"dashscope://file-{file_id}" if file_id else ""
-            if not file_url:
-                raise RuntimeError(f"音频上传失败: {upload_data}")
-            log.info("音频已上传: %s", file_url[:80])
+        import dashscope
+        from dashscope.audio.asr import Transcription
+        dashscope.api_key = api_key
 
-        # Step 2: 提交转写任务
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "X-DashScope-Async": "enable",
-                },
-                json={
-                    "model": "paraformer-v2",
-                    "input": {"file_urls": [file_url]},
-                    "parameters": {
-                        "language_hints": ["zh", "en"],
-                    },
-                },
-            )
-            resp.raise_for_status()
-            task_data = resp.json()
-            task_id = task_data.get("output", {}).get("task_id", "")
-            if not task_id:
-                raise RuntimeError(f"ASR 提交失败: {task_data}")
-            log.info("ASR 任务已提交: %s", task_id)
+        # Step 1: 用 SDK 上传文件到 DashScope 临时 OSS
+        log.info("上传音频到 DashScope: %s (%.1fMB)", upload_path, os.path.getsize(upload_path) / 1024 / 1024)
+        file_urls = await asyncio.to_thread(
+            Transcription.async_call,
+            model="paraformer-v2",
+            file_urls=[upload_path],
+            language_hints=["zh", "en"],
+        )
 
-        # Step 3: 轮询结果
-        async with httpx.AsyncClient(timeout=30) as client:
-            for _ in range(120):  # 最多等 10 分钟
-                await asyncio.sleep(5)
-                resp = await client.get(
-                    f"https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                )
-                resp.raise_for_status()
-                result = resp.json()
-                status = result.get("output", {}).get("task_status", "")
-                if status == "SUCCEEDED":
-                    break
-                elif status == "FAILED":
-                    raise RuntimeError(f"ASR 失败: {result}")
-                log.info("ASR 进行中... (%s)", status)
-            else:
-                raise TimeoutError("ASR 超时")
+        # async_call 返回的是一个 task response
+        task_response = file_urls
+        task_id = ""
+        if hasattr(task_response, "output") and task_response.output:
+            task_id = task_response.output.get("task_id", "")
+        if not task_id:
+            raise RuntimeError(f"ASR 提交失败: {task_response}")
+        log.info("ASR 任务已提交: %s", task_id)
 
-        # Step 4: 解析结果
-        transcription = result.get("output", {}).get("results", [])
+        # Step 2: 轮询等待结果
+        for _ in range(180):  # 最多等 15 分钟
+            await asyncio.sleep(5)
+            result = await asyncio.to_thread(Transcription.fetch, task_id)
+            status = ""
+            if hasattr(result, "output") and result.output:
+                status = result.output.get("task_status", "")
+            if status == "SUCCEEDED":
+                break
+            elif status == "FAILED":
+                raise RuntimeError(f"ASR 失败: {result.output}")
+            log.info("ASR 进行中... (%s)", status)
+        else:
+            raise TimeoutError("ASR 超时（15分钟）")
+
+        # Step 3: 解析结果
+        transcription_results = result.output.get("results", [])
         segments = []
         full_text_parts = []
-        for item in transcription:
+        for item in transcription_results:
             url = item.get("transcription_url", "")
             if url:
                 async with httpx.AsyncClient(timeout=30) as client:
@@ -532,7 +506,13 @@ async def run_ai_pipeline(manifest_path: str, progress_cb=None) -> dict:
             else:
                 log.info("ASR 成功: %d 字, %d 段", len(transcript["text"]), len(transcript.get("segments", [])))
         except Exception as e:
-            errors.append(f"❌ ASR 失败: {e}")
+            err_detail = str(e) or repr(e)
+            if hasattr(e, 'response'):
+                try:
+                    err_detail += f" | HTTP {e.response.status_code}: {e.response.text[:500]}"
+                except Exception:
+                    pass
+            errors.append(f"❌ ASR 失败: {err_detail}")
 
     # Step 2: Visual Analysis — 失败记录但不阻断
     visual_results = []
@@ -547,7 +527,13 @@ async def run_ai_pipeline(manifest_path: str, progress_cb=None) -> dict:
             visual_results = await analyze_keyframes(keyframes, ds_key)
             log.info("视觉分析成功: %d 张", len(visual_results))
         except Exception as e:
-            errors.append(f"❌ 视觉分析失败: {e}")
+            err_detail = str(e) or repr(e)
+            if hasattr(e, 'response'):
+                try:
+                    err_detail += f" | HTTP {e.response.status_code}: {e.response.text[:500]}"
+                except Exception:
+                    pass
+            errors.append(f"❌ 视觉分析失败: {err_detail}")
 
     # Step 3: Knowledge Extraction — 必须有 ASR 文本才能提取
     knowledge = {"summary": "", "knowledge_points": [], "outline": []}
@@ -565,7 +551,13 @@ async def run_ai_pipeline(manifest_path: str, progress_cb=None) -> dict:
             else:
                 log.info("知识点提取成功: %d 个", len(knowledge["knowledge_points"]))
         except Exception as e:
-            errors.append(f"❌ 知识点提取失败: {e}")
+            err_detail = str(e) or repr(e)
+            if hasattr(e, 'response'):
+                try:
+                    err_detail += f" | HTTP {e.response.status_code}: {e.response.text[:500]}"
+                except Exception:
+                    pass
+            errors.append(f"❌ 知识点提取失败: {err_detail}")
 
     # Step 4: 生成报告 — 如果有错误，在报告开头显示
     if progress_cb:
