@@ -266,11 +266,12 @@ async def extract_knowledge(
 ) -> dict:
     """
     调用 DeepSeek 融合音频+视觉信息，提取教学级知识点。
+    长视频自动分块摘要再汇总，确保覆盖全部内容。
     返回 {"knowledge_points": [...], "summary": "...", "outline": [...]}
     """
     log.info("知识点提取: DeepSeek")
 
-    # 构建视觉内容摘要（带帧索引，用于后续关联截图）
+    # 构建视觉内容摘要（带帧索引）
     visual_summary = []
     for vr in visual_results:
         line = f"[帧{vr.get('index',0)} {vr['timestamp']:.1f}s] {vr.get('visual_type','?')}"
@@ -280,14 +281,300 @@ async def extract_knowledge(
             line += f" | {vr['description'][:150]}"
         visual_summary.append(line)
 
-    # 构建转写文本（带时间戳）
-    transcript_lines = []
-    for seg in transcript.get("segments", [])[:300]:
-        transcript_lines.append(f"[{seg['start']:.1f}s-{seg['end']:.1f}s] {seg['text']}")
+    # 构建全部转写文本（不截断）
+    all_segments = transcript.get("segments", [])
+    log.info("ASR 总段数: %d", len(all_segments))
 
-    has_transcript = len(transcript_lines) > 0
+    has_transcript = len(all_segments) > 0
     has_visual = len(visual_summary) > 0
 
+    # ── 分块策略：按 15 分钟分块 ──
+    CHUNK_SECONDS = 900  # 15 分钟
+
+    if has_transcript and len(all_segments) > 400:
+        # 长视频：分块摘要 → 汇总
+        log.info("长视频模式: 分块摘要再汇总")
+        chunk_summaries = await _chunked_summarize(
+            all_segments, visual_summary, video_name,
+            deepseek_key, deepseek_url, CHUNK_SECONDS
+        )
+        # 用分块摘要做最终汇总
+        result = await _final_synthesis(
+            chunk_summaries, visual_summary, video_name,
+            deepseek_key, deepseek_url
+        )
+    else:
+        # 短视频：直接一次性处理
+        transcript_lines = []
+        for seg in all_segments:
+            transcript_lines.append(f"[{seg['start']:.1f}s-{seg['end']:.1f}s] {seg['text']}")
+        result = await _single_pass_extract(
+            transcript_lines, visual_summary, video_name,
+            has_transcript, has_visual, deepseek_key, deepseek_url
+        )
+
+    log.info("知识点提取完成: %d 个知识点", len(result.get("knowledge_points", [])))
+    return result
+
+
+async def _chunked_summarize(
+    segments: list[dict], visual_summary: list[str], video_name: str,
+    dk_key: str, dk_url: str, chunk_seconds: int,
+) -> list[dict]:
+    """把 ASR 文本按时间分块，每块单独提取要点。"""
+    # 按时间分块
+    chunks = []
+    current_chunk = []
+    chunk_start = 0
+    chunk_idx = 0
+
+    for seg in segments:
+        t = seg.get("start", 0)
+        if t >= chunk_start + chunk_seconds and current_chunk:
+            chunks.append({
+                "index": chunk_idx,
+                "start_sec": chunk_start,
+                "end_sec": t,
+                "lines": current_chunk,
+            })
+            chunk_idx += 1
+            chunk_start = t
+            current_chunk = []
+        current_chunk.append(f"[{seg['start']:.1f}s-{seg['end']:.1f}s] {seg['text']}")
+
+    if current_chunk:
+        end_t = segments[-1].get("end", chunk_start + chunk_seconds)
+        chunks.append({
+            "index": chunk_idx,
+            "start_sec": chunk_start,
+            "end_sec": end_t,
+            "lines": current_chunk,
+        })
+
+    log.info("分块: %d 块 (每块 %d 分钟)", len(chunks), chunk_seconds // 60)
+
+    # 找每块对应的视觉分析
+    def get_visual_for_chunk(start, end):
+        result = []
+        for v in visual_summary:
+            # 从 "[帧X 123.4s]" 提取时间
+            try:
+                ts = float(v.split("s]")[0].split()[-1])
+                if start <= ts <= end:
+                    result.append(v)
+            except (ValueError, IndexError):
+                pass
+        return result
+
+    # 并发处理每块（最多 3 路并发避免限流）
+    CONCURRENCY = 3
+    sem = asyncio.Semaphore(CONCURRENCY)
+    chunk_results = []
+
+    async def process_chunk(chunk):
+        async with sem:
+            chunk_visual = get_visual_for_chunk(chunk["start_sec"], chunk["end_sec"])
+            start_m = int(chunk["start_sec"] // 60)
+            end_m = int(chunk["end_sec"] // 60)
+            transcript_text = "\n".join(chunk["lines"])
+            visual_text = "\n".join(chunk_visual) if chunk_visual else "（该时段无画面分析）"
+
+            prompt = f"""你是知识整理专家。以下是一段视频的第 {start_m}-{end_m} 分钟的内容。
+请提取这段时间内的**所有知识要点**。
+
+## 重要约束
+1. 只能使用下面提供的素材，严禁添加素材中没有的信息
+2. 时间戳必须来自素材中的实际时间
+3. 如果这段时间是闲聊/寒暄/无实质内容，直接返回空列表
+4. 宁可少写也不要编造
+
+## 视频名称
+{video_name}
+
+## 音频转写（{start_m}-{end_m}分钟）
+{transcript_text}
+
+## 画面分析
+{visual_text}
+
+请用 JSON 格式输出：
+```json
+{{
+  "segment_summary": "这段时间的一句话概述",
+  "has_knowledge": true/false,
+  "points": [
+    {{
+      "title": "知识点标题",
+      "content": "详细内容（100-300字）",
+      "time_start_sec": 0,
+      "time_end_sec": 0,
+      "importance": "high/medium/low",
+      "related_frame_indices": [],
+      "key_takeaways": ["要点1", "要点2"]
+    }}
+  ]
+}}
+```
+只返回 JSON。"""
+
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    f"{dk_url}/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {dk_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "deepseek-chat",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 4096,
+                        "temperature": 0.3,
+                    },
+                )
+                resp.raise_for_status()
+                answer = resp.json()["choices"][0]["message"]["content"]
+
+            try:
+                data = json.loads(answer.strip().strip("```json").strip("```").strip())
+            except json.JSONDecodeError:
+                data = {"segment_summary": answer[:200], "has_knowledge": False, "points": []}
+
+            data["start_sec"] = chunk["start_sec"]
+            data["end_sec"] = chunk["end_sec"]
+            log.info("  块 %d/%d (%d-%d分钟): %d 个知识点",
+                     chunk["index"] + 1, len(chunks), start_m, end_m,
+                     len(data.get("points", [])))
+            return data
+
+    tasks = [process_chunk(c) for c in chunks]
+    chunk_results = await asyncio.gather(*tasks)
+    return sorted(chunk_results, key=lambda x: x.get("start_sec", 0))
+
+
+async def _final_synthesis(
+    chunk_summaries: list[dict], visual_summary: list[str],
+    video_name: str, dk_key: str, dk_url: str,
+) -> dict:
+    """把分块摘要汇总成最终报告。"""
+    # 构建分块摘要文本
+    summary_lines = []
+    all_points = []
+    for cs in chunk_summaries:
+        start_m = int(cs.get("start_sec", 0) // 60)
+        end_m = int(cs.get("end_sec", 0) // 60)
+        summary_lines.append(f"[{start_m}-{end_m}分钟] {cs.get('segment_summary', '无摘要')}")
+        for pt in cs.get("points", []):
+            all_points.append(pt)
+
+    log.info("汇总: %d 块摘要, %d 个知识点", len(chunk_summaries), len(all_points))
+
+    # 如果知识点不多，直接用分块结果组装
+    if len(all_points) <= 30:
+        # 生成摘要和大纲
+        prompt = f"""根据以下视频分段摘要，生成：
+1. 一段 100-200 字的整体摘要
+2. 视频大纲（按时间顺序的章节列表）
+
+## 视频名称
+{video_name}
+
+## 分段摘要
+{chr(10).join(summary_lines)}
+
+用 JSON 格式输出：
+```json
+{{
+  "summary": "整体摘要...",
+  "outline": [{{"title": "章节名", "time_start_sec": 0, "time_end_sec": 300}}]
+}}
+```
+只返回 JSON。"""
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{dk_url}/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {dk_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "deepseek-chat",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 4096,
+                    "temperature": 0.3,
+                },
+            )
+            resp.raise_for_status()
+            answer = resp.json()["choices"][0]["message"]["content"]
+
+        try:
+            meta = json.loads(answer.strip().strip("```json").strip("```").strip())
+        except json.JSONDecodeError:
+            meta = {"summary": "", "outline": []}
+
+        return {
+            "summary": meta.get("summary", ""),
+            "outline": meta.get("outline", []),
+            "knowledge_points": all_points,
+        }
+    else:
+        # 知识点太多，让 DeepSeek 合并去重
+        points_text = json.dumps(all_points, ensure_ascii=False)[:30000]
+        prompt = f"""以下是从一段 {video_name} 视频中分块提取的知识点（可能有重复）。
+请合并去重，生成最终的知识笔记。
+
+## 重要约束
+1. 只能使用提供的知识点内容，不要添加新信息
+2. 合并相似的知识点，保留最详细的版本
+3. 时间戳保持原样
+
+## 分段摘要
+{chr(10).join(summary_lines)}
+
+## 知识点列表
+{points_text}
+
+用 JSON 格式输出：
+```json
+{{
+  "summary": "整体摘要（100-200字）",
+  "outline": [{{"title": "章节名", "time_start_sec": 0, "time_end_sec": 300}}],
+  "knowledge_points": [...]
+}}
+```
+只返回 JSON。"""
+
+        async with httpx.AsyncClient(timeout=300) as client:
+            resp = await client.post(
+                f"{dk_url}/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {dk_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "deepseek-chat",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 16384,
+                    "temperature": 0.3,
+                },
+            )
+            resp.raise_for_status()
+            answer = resp.json()["choices"][0]["message"]["content"]
+
+        try:
+            result = json.loads(answer.strip().strip("```json").strip("```").strip())
+        except json.JSONDecodeError:
+            result = {"summary": "", "knowledge_points": all_points[:30], "outline": []}
+
+        return result
+
+
+async def _single_pass_extract(
+    transcript_lines: list[str], visual_summary: list[str],
+    video_name: str, has_transcript: bool, has_visual: bool,
+    dk_key: str, dk_url: str,
+) -> dict:
+    """短视频：一次性提取知识点。"""
     prompt = f"""你是一位资深知识整理专家。你的任务是根据下面提供的**实际素材**，整理成一份可以直接用来学习的详细笔记。
 
 ## 重要约束（必须遵守）
@@ -301,8 +588,7 @@ async def extract_knowledge(
 {video_name}
 
 ## 音频转写（带时间戳）
-{"（无音频转写数据）" if not has_transcript else chr(10).join(transcript_lines[:250])}
-{"... (更多内容省略)" if len(transcript_lines) > 250 else ""}
+{"（无音频转写数据）" if not has_transcript else chr(10).join(transcript_lines)}
 
 ## 画面分析（关键帧截图内容）
 {"（无画面分析数据）" if not has_visual else chr(10).join(visual_summary)}
@@ -353,9 +639,9 @@ async def extract_knowledge(
 
     async with httpx.AsyncClient(timeout=300) as client:
         resp = await client.post(
-            f"{deepseek_url}/v1/chat/completions",
+            f"{dk_url}/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {deepseek_key}",
+                "Authorization": f"Bearer {dk_key}",
                 "Content-Type": "application/json",
             },
             json={
@@ -373,7 +659,6 @@ async def extract_knowledge(
     except json.JSONDecodeError:
         result = {"summary": answer[:500], "knowledge_points": [], "outline": []}
 
-    log.info("知识点提取完成: %d 个知识点", len(result.get("knowledge_points", [])))
     return result
 
 
