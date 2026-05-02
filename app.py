@@ -192,25 +192,34 @@ async def run_pipeline(task_id: str, video_path: str):
             "--skip-oss",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            limit=10 * 1024 * 1024,  # 10MB buffer for long progress lines
         )
-        # 逐行读取输出，根据关键词更新进度
+        # 逐块读取输出（PySceneDetect 用 \r 刷新进度条，不产生 \n）
         output_lines = []
         while True:
-            line = await proc.stdout.readline()
-            if not line:
+            try:
+                chunk = await asyncio.wait_for(proc.stdout.read(8192), timeout=300)
+            except asyncio.TimeoutError:
                 break
-            text = line.decode(errors="replace").strip()
-            output_lines.append(text)
-            if "audio" in text.lower() or "ffmpeg" in text.lower():
-                await db.update_task(task_id, stage="提取音频", progress=15)
-            elif "scene" in text.lower() or "detect" in text.lower():
-                await db.update_task(task_id, stage="场景检测", progress=20)
-            elif "hash" in text.lower() or "phash" in text.lower() or "dedup" in text.lower():
-                await db.update_task(task_id, stage="关键帧去重", progress=28)
-            elif "ppt" in text.lower() or "filter" in text.lower():
-                await db.update_task(task_id, stage="PPT 过滤", progress=32)
-            elif "manifest" in text.lower() or "done" in text.lower():
-                await db.update_task(task_id, stage="生成 Manifest", progress=38)
+            if not chunk:
+                break
+            text = chunk.decode(errors="replace")
+            for line in text.replace("\r", "\n").split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                output_lines.append(line)
+                ll = line.lower()
+                if "audio" in ll or "ffmpeg" in ll:
+                    await db.update_task(task_id, stage="提取音频", progress=15)
+                elif "scene" in ll or "detect" in ll:
+                    await db.update_task(task_id, stage="场景检测", progress=20)
+                elif "hash" in ll or "phash" in ll or "dedup" in ll:
+                    await db.update_task(task_id, stage="关键帧去重", progress=28)
+                elif "ppt" in ll or "filter" in ll:
+                    await db.update_task(task_id, stage="PPT 过滤", progress=32)
+                elif "manifest" in ll or "done" in ll:
+                    await db.update_task(task_id, stage="生成 Manifest", progress=38)
         await proc.wait()
         if proc.returncode != 0:
             raise RuntimeError(f"预处理失败: {chr(10).join(output_lines[-10:])}")
