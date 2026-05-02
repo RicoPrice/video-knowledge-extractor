@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 import database as db
+import ai_pipeline
 
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -154,7 +155,7 @@ async def api_download(task_id: str, fmt: str):
 # ── Background pipeline ──────────────────────────
 
 async def run_pipeline(task_id: str, video_path: str):
-    """Run the full pipeline: preprocess → Dify Workflow."""
+    """Run the full pipeline: preprocess → AI analysis."""
     try:
         await db.update_task(task_id, status="processing", stage="预处理", progress=5)
 
@@ -186,28 +187,19 @@ async def run_pipeline(task_id: str, video_path: str):
             manifest = f.read()
         await db.update_task(task_id, manifest_json=manifest)
 
-        await db.update_task(task_id, stage="调用 AI Workflow", progress=50)
-        config = load_config()
-        dify_cfg = config.get("dify", {})
-        dify_url = dify_cfg.get("base_url", "http://localhost/v1")
-        dify_key = dify_cfg.get("api_key", "")
+        # AI 分析（直接调用 API，不经过 Dify）
+        async def progress_cb(stage, pct):
+            await db.update_task(task_id, stage=stage, progress=pct)
 
-        if dify_key:
-            report = await call_dify_workflow(dify_url, dify_key, manifest)
-            await db.update_task(task_id, stage="生成报告", progress=90)
-            md = report.get("markdown_output", "")
-            rj = report.get("json_output", "")
-            srt = report.get("srt_output", "")
-            html = report.get("html_output", "")
-        else:
-            await db.update_task(task_id, stage="生成预览报告", progress=90)
-            md = generate_preview_report(manifest)
-            rj, srt, html = "", "", ""
+        await db.update_task(task_id, stage="AI 分析中", progress=45)
+        result = await ai_pipeline.run_ai_pipeline(manifest_path, progress_cb=progress_cb)
 
         await db.update_task(
             task_id, status="completed", stage="完成", progress=100,
-            report_markdown=md, report_json=rj,
-            report_srt=srt, report_html=html,
+            report_markdown=result.get("markdown", ""),
+            report_json=result.get("json", ""),
+            report_srt=result.get("srt", ""),
+            report_html="",
         )
     except asyncio.CancelledError:
         await db.update_task(task_id, status="cancelled", stage="已取消")
@@ -215,38 +207,3 @@ async def run_pipeline(task_id: str, video_path: str):
         await db.update_task(task_id, status="failed", stage="失败", error=str(e)[:1000])
     finally:
         _running_tasks.pop(task_id, None)
-
-
-async def call_dify_workflow(base_url: str, api_key: str, manifest_json: str) -> dict:
-    async with httpx.AsyncClient(timeout=600) as client:
-        resp = await client.post(
-            f"{base_url}/workflows/run",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"inputs": {"manifest_json": manifest_json}, "response_mode": "blocking", "user": "web-app"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("data", {}).get("outputs", {})
-
-
-def generate_preview_report(manifest_json: str) -> str:
-    """When Dify API key is not configured, generate a basic preview from manifest."""
-    m = json.loads(manifest_json)
-    lines = [
-        f"# {m.get('video_name', '视频')} — 预处理报告\n",
-        f"生成时间: {m.get('created_at', '')}\n",
-        "## 统计信息\n",
-    ]
-    stats = m.get("stats", {})
-    lines.append(f"- 总场景数: {stats.get('total_scenes', 0)}")
-    lines.append(f"- PPT 帧: {stats.get('ppt_frames', 0)}")
-    lines.append(f"- 非 PPT 帧: {stats.get('non_ppt_frames', 0)}\n")
-    lines.append("## 关键帧列表\n")
-    lines.append("| # | 时间 | 类型 |")
-    lines.append("|---|------|------|")
-    for kf in m.get("keyframes", []):
-        t = f"{kf['timestamp']:.1f}s"
-        ktype = "PPT" if kf.get("is_ppt") else "画面"
-        lines.append(f"| {kf['index']} | {t} | {ktype} |")
-    lines.append("\n> Dify Workflow API Key 未配置，仅显示预处理结果。配置后可获得完整 AI 分析报告。")
-    return "\n".join(lines)
