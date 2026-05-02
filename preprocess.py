@@ -187,7 +187,7 @@ def is_ppt_frame(filepath: str) -> bool:
                 horizontal_count += 1
 
     is_ppt = (edge_density > 0.02 and color_std < 40 and horizontal_count >= 3)
-    return is_ppt
+    return bool(is_ppt)
 
 
 def filter_ppt_frames(keyframes: list[dict]) -> list[dict]:
