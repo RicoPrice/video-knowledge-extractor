@@ -30,13 +30,34 @@ def _load_config() -> dict:
 async def transcribe_audio(audio_path: str, api_key: str) -> dict:
     """
     调用阿里云百炼 Paraformer-v2 进行语音转写。
+    先上传音频到 DashScope 文件服务，再提交异步转写任务。
     返回 {"text": "全文", "segments": [{"start": 0.0, "end": 1.5, "text": "..."}]}
     """
     log.info("ASR 转写: %s", audio_path)
 
-    # Paraformer 异步转写：先提交任务，再轮询结果
+    # Step 0: 上传音频文件到 DashScope
+    log.info("上传音频到 DashScope...")
+    async with httpx.AsyncClient(timeout=300) as client:
+        with open(audio_path, "rb") as f:
+            resp = await client.post(
+                "https://dashscope.aliyuncs.com/api/v1/uploads",
+                headers={"Authorization": f"Bearer {api_key}"},
+                files={"file": (os.path.basename(audio_path), f, "audio/wav")},
+                data={"purpose": "file-extract"},
+            )
+        resp.raise_for_status()
+        upload_data = resp.json()
+        file_url = upload_data.get("data", {}).get("uploaded_url", "")
+        if not file_url:
+            # 备选：尝试从 id 构造
+            file_id = upload_data.get("data", {}).get("file_id") or upload_data.get("id", "")
+            file_url = f"dashscope://file-{file_id}" if file_id else ""
+        if not file_url:
+            raise RuntimeError(f"音频上传失败: {upload_data}")
+        log.info("音频已上传: %s", file_url[:80])
+
+    # Step 1: 提交转写任务
     async with httpx.AsyncClient(timeout=30) as client:
-        # Step 1: 提交转写任务
         resp = await client.post(
             "https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription",
             headers={
@@ -46,7 +67,7 @@ async def transcribe_audio(audio_path: str, api_key: str) -> dict:
             },
             json={
                 "model": "paraformer-v2",
-                "input": {"file_urls": [f"file://{audio_path}"]},
+                "input": {"file_urls": [file_url]},
                 "parameters": {
                     "language_hints": ["zh", "en"],
                 },

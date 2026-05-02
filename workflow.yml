@@ -1,82 +1,878 @@
 app:
-  description: "视频知识提取工作流"
-  icon: "\U0001F3AC"
-  icon_background: "#2B0E44"
+  description: 视频知识提取工作流
+  icon: 🎬
+  icon_background: '#2B0E44'
   mode: workflow
-  name: "视频知识提取 Video Knowledge Extractor"
+  name: 视频知识提取 Video Knowledge Extractor
   use_icon_as_answer_icon: false
 kind: app
 version: 0.1.5
 workflow:
   conversation_variables: []
   environment_variables:
-    - description: "DashScope API Key"
-      id: env-dashscope-key
-      name: DASHSCOPE_API_KEY
-      value_type: secret
-      value: ""
-    - description: "DeepSeek API Key"
-      id: env-deepseek-key
-      name: DEEPSEEK_API_KEY
-      value_type: secret
-      value: ""
+  - description: DashScope API Key
+    id: env-dashscope-key
+    name: DASHSCOPE_API_KEY
+    value_type: secret
+    value: ''
+  - description: DeepSeek API Key
+    id: env-deepseek-key
+    name: DEEPSEEK_API_KEY
+    value_type: secret
+    value: ''
   features: {}
   graph:
     edges:
-      - id: e1
-        source: start
-        target: parse_manifest
-        sourceHandle: source
-        targetHandle: target
-      - id: e2
-        source: parse_manifest
-        target: asr_request
-        sourceHandle: source
-        targetHandle: target
-      - id: e3
-        source: asr_request
-        target: semantic_segment
-        sourceHandle: source
-        targetHandle: target
-      - id: e4
-        source: semantic_segment
-        target: visual_analysis
-        sourceHandle: source
-        targetHandle: target
-      - id: e5
-        source: visual_analysis
-        target: timestamp_align
-        sourceHandle: source
-        targetHandle: target
-      - id: e6
-        source: timestamp_align
-        target: denoise
-        sourceHandle: source
-        targetHandle: target
-      - id: e7
-        source: denoise
-        target: knowledge_extract
-        sourceHandle: source
-        targetHandle: target
-      - id: e8
-        source: knowledge_extract
-        target: dedup_aggregate
-        sourceHandle: source
-        targetHandle: target
-      - id: e9
-        source: dedup_aggregate
-        target: final_polish
-        sourceHandle: source
-        targetHandle: target
-      - id: e10
-        source: final_polish
-        target: multi_format_output
-        sourceHandle: source
-        targetHandle: target
-      - id: e11
-        source: multi_format_output
-        target: end
-        sourceHandle: source
-        targetHandle: target
-    nodes: []
-  hash: "video-knowledge-extractor-v1"
+    - id: e1
+      source: start
+      target: parse_manifest
+      sourceHandle: source
+      targetHandle: target
+    - id: e2
+      source: parse_manifest
+      target: asr_request
+      sourceHandle: source
+      targetHandle: target
+    - id: e3
+      source: asr_request
+      target: semantic_segment
+      sourceHandle: source
+      targetHandle: target
+    - id: e4
+      source: semantic_segment
+      target: visual_analysis
+      sourceHandle: source
+      targetHandle: target
+    - id: e5
+      source: visual_analysis
+      target: timestamp_align
+      sourceHandle: source
+      targetHandle: target
+    - id: e6
+      source: timestamp_align
+      target: denoise
+      sourceHandle: source
+      targetHandle: target
+    - id: e7
+      source: denoise
+      target: knowledge_extract
+      sourceHandle: source
+      targetHandle: target
+    - id: e8
+      source: knowledge_extract
+      target: dedup_aggregate
+      sourceHandle: source
+      targetHandle: target
+    - id: e9
+      source: dedup_aggregate
+      target: final_polish
+      sourceHandle: source
+      targetHandle: target
+    - id: e10
+      source: final_polish
+      target: multi_format_output
+      sourceHandle: source
+      targetHandle: target
+    - id: e11
+      source: multi_format_output
+      target: end
+      sourceHandle: source
+      targetHandle: target
+    nodes:
+    - data:
+        type: start
+        title: 开始
+        variables:
+        - label: manifest_json
+          max_length: 1048576
+          required: true
+          type: paragraph
+          variable: manifest_json
+      id: start
+      position:
+        x: 80
+        y: 280
+    - data:
+        type: code
+        title: 解析 Manifest
+        desc: 解析视频预处理器输出的 manifest.json
+        variables:
+        - value_selector:
+          - start
+          - manifest_json
+          variable: manifest_json
+        code_language: python3
+        code: |
+          import json
+
+          def main(manifest_json: str) -> dict:
+              manifest = json.loads(manifest_json)
+              video_title = manifest.get("title", "Untitled")
+              video_duration = manifest.get("duration", 0)
+              audio_url = manifest.get("audio", {}).get("url", "")
+              if not audio_url:
+                  audio_url = manifest.get("audio_url", "")
+              keyframes = manifest.get("keyframes", [])
+              normalized = []
+              for kf in keyframes:
+                  normalized.append({
+                      "timestamp": kf.get("timestamp", 0),
+                      "url": kf.get("url", kf.get("image_url", "")),
+                      "index": kf.get("index", len(normalized)),
+                  })
+              normalized.sort(key=lambda x: x["timestamp"])
+              return {
+                  "audio_url": audio_url,
+                  "keyframes_json": json.dumps(normalized, ensure_ascii=False),
+                  "video_title": video_title,
+                  "video_duration": float(video_duration),
+              }
+        outputs:
+          audio_url:
+            type: string
+          keyframes_json:
+            type: string
+          video_title:
+            type: string
+          video_duration:
+            type: number
+      id: parse_manifest
+      position:
+        x: 380
+        y: 280
+    - data:
+        type: http-request
+        title: ASR 语音转录
+        desc: 调用 DashScope Paraformer-v2 进行语音识别
+        variables:
+        - value_selector:
+          - parse_manifest
+          - audio_url
+          variable: audio_url
+        method: post
+        url: https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription
+        headers: "Authorization:Bearer {{#env.DASHSCOPE_API_KEY#}}\nContent-Type:application/json\nX-DashScope-Async:enable"
+        params: ''
+        body:
+          type: json
+          data: |-
+            {
+              "model": "paraformer-v2",
+              "input": {
+                "file_urls": ["{{#parse_manifest.audio_url#}}"]
+              },
+              "parameters": {
+                "language_hints": ["zh", "en"],
+                "diarization_enabled": false,
+                "timestamp_alignment_enabled": true,
+                "auto_chapters_enabled": false
+              }
+            }
+        authorization:
+          type: no-auth
+        timeout:
+          connect: 10
+          read: 300
+          write: 30
+        retry:
+          max_retries: 3
+          retry_interval: 1000
+      id: asr_request
+      position:
+        x: 680
+        y: 280
+    - data:
+        type: code
+        title: 语义分段
+        desc: 基于时间戳和主题变化将 ASR 转录切分为语义段落
+        variables:
+        - value_selector:
+          - asr_request
+          - body
+          variable: asr_response
+        - value_selector:
+          - parse_manifest
+          - keyframes_json
+          variable: keyframes_json
+        code_language: python3
+        code: |
+          import json
+          import re
+
+          def main(asr_response: str, keyframes_json: str) -> dict:
+              asr = json.loads(asr_response) if isinstance(asr_response, str) else asr_response
+              transcripts = asr.get("output", {}).get("results", [])
+              if not transcripts:
+                  transcripts = asr.get("transcripts", asr.get("results", []))
+
+              sentences = []
+              for t in transcripts:
+                  words = t.get("words", t.get("sentence", {}).get("words", []))
+                  text = t.get("text", "")
+                  begin = t.get("begin_time", t.get("start", 0))
+                  end_t = t.get("end_time", t.get("end", 0))
+                  sentences.append({
+                      "text": text,
+                      "start_ms": int(begin),
+                      "end_ms": int(end_t),
+                  })
+
+              if not sentences:
+                  full_text = asr.get("output", {}).get("text", "")
+                  if full_text:
+                      sentences = [{"text": full_text, "start_ms": 0, "end_ms": 0}]
+
+              segments = []
+              current_seg = {"texts": [], "start_ms": 0, "end_ms": 0}
+              GAP_THRESHOLD_MS = 3000
+              MAX_SEG_DURATION_MS = 60000
+
+              for s in sentences:
+                  gap = s["start_ms"] - current_seg["end_ms"] if current_seg["texts"] else 0
+                  seg_dur = s["end_ms"] - current_seg["start_ms"] if current_seg["texts"] else 0
+                  if current_seg["texts"] and (gap > GAP_THRESHOLD_MS or seg_dur > MAX_SEG_DURATION_MS):
+                      segments.append({
+                          "id": len(segments),
+                          "text": "".join(current_seg["texts"]),
+                          "start_ms": current_seg["start_ms"],
+                          "end_ms": current_seg["end_ms"],
+                      })
+                      current_seg = {"texts": [], "start_ms": s["start_ms"], "end_ms": s["end_ms"]}
+                  if not current_seg["texts"]:
+                      current_seg["start_ms"] = s["start_ms"]
+                  current_seg["texts"].append(s["text"])
+                  current_seg["end_ms"] = s["end_ms"]
+
+              if current_seg["texts"]:
+                  segments.append({
+                      "id": len(segments),
+                      "text": "".join(current_seg["texts"]),
+                      "start_ms": current_seg["start_ms"],
+                      "end_ms": current_seg["end_ms"],
+                  })
+
+              return {
+                  "segments_json": json.dumps(segments, ensure_ascii=False),
+                  "segment_count": len(segments),
+              }
+        outputs:
+          segments_json:
+            type: string
+          segment_count:
+            type: number
+      id: semantic_segment
+      position:
+        x: 980
+        y: 280
+    - data:
+        type: llm
+        title: 视觉分析
+        desc: 使用 Qwen-VL-Max 分析关键帧图像
+        model:
+          provider: tongyi
+          name: qwen-vl-max
+          mode: chat
+          completion_params:
+            temperature: 0.2
+            max_tokens: 4096
+        prompt_template:
+        - role: system
+          text: |
+            你是一个专业的视频内容分析助手。你的任务是分析视频关键帧图像，提取其中的视觉信息。
+
+            对于每一帧图像，你需要判断：
+            1. 图像类型：PPT/幻灯片、白板、代码编辑器、终端/命令行、网页、人物特写、场景画面、图表/示意图、其他
+            2. 如果是 PPT/文档/白板，提取其中所有可见文字（OCR）
+            3. 如果是图表/示意图，描述图表内容和关键数据
+            4. 如果是代码/终端，提取代码内容和关键命令
+            5. 提取画面中的关键视觉元素和布局信息
+
+            输出格式为 JSON 数组，每个元素对应一个关键帧：
+            ```json
+            [
+              {
+                "index": 0,
+                "timestamp": 12500,
+                "frame_type": "ppt",
+                "ocr_text": "提取的文字内容",
+                "description": "画面描述",
+                "key_elements": ["元素1", "元素2"],
+                "confidence": 0.95
+              }
+            ]
+            ```
+        - role: user
+          text: |
+            以下是视频的关键帧信息，请逐一分析每个关键帧图像：
+
+            关键帧列表：
+            {{#semantic_segment.segments_json#}}
+
+            关键帧图像数据：
+            {{#parse_manifest.keyframes_json#}}
+
+            请分析所有关键帧并以 JSON 数组格式返回结果。
+        vision:
+          enabled: true
+        variables:
+        - value_selector:
+          - semantic_segment
+          - segments_json
+          variable: segments_json
+        - value_selector:
+          - parse_manifest
+          - keyframes_json
+          variable: keyframes_json
+        memory:
+        context:
+          enabled: false
+      id: visual_analysis
+      position:
+        x: 1280
+        y: 280
+    - data:
+        type: code
+        title: 时间戳对齐
+        desc: 将视觉分析结果与 ASR 语义段落按时间戳对齐
+        variables:
+        - value_selector:
+          - visual_analysis
+          - text
+          variable: visual_analysis
+        - value_selector:
+          - semantic_segment
+          - segments_json
+          variable: segments_json
+        code_language: python3
+        code: |
+          import json
+          import re
+
+          def main(visual_analysis: str, segments_json: str) -> dict:
+              segments = json.loads(segments_json)
+
+              visual_data = []
+              json_match = re.search(r'\[.*\]', visual_analysis, re.DOTALL)
+              if json_match:
+                  try:
+                      visual_data = json.loads(json_match.group())
+                  except json.JSONDecodeError:
+                      visual_data = []
+
+              visual_by_ts = {}
+              for v in visual_data:
+                  ts = v.get("timestamp", 0)
+                  visual_by_ts[ts] = v
+
+              aligned = []
+              for seg in segments:
+                  seg_start = seg["start_ms"]
+                  seg_end = seg["end_ms"]
+                  matched_visuals = []
+                  for ts, v in visual_by_ts.items():
+                      if seg_start - 2000 <= ts <= seg_end + 2000:
+                          matched_visuals.append(v)
+                  matched_visuals.sort(key=lambda x: x.get("timestamp", 0))
+
+                  ocr_texts = []
+                  frame_types = []
+                  for mv in matched_visuals:
+                      if mv.get("ocr_text"):
+                          ocr_texts.append(mv["ocr_text"])
+                      if mv.get("frame_type"):
+                          frame_types.append(mv["frame_type"])
+
+                  aligned.append({
+                      "segment_id": seg["id"],
+                      "start_ms": seg_start,
+                      "end_ms": seg_end,
+                      "transcript": seg["text"],
+                      "visual_frames": matched_visuals,
+                      "ocr_combined": "\n".join(ocr_texts),
+                      "frame_types": list(set(frame_types)),
+                      "has_visual": len(matched_visuals) > 0,
+                  })
+
+              return {
+                  "aligned_json": json.dumps(aligned, ensure_ascii=False),
+              }
+        outputs:
+          aligned_json:
+            type: string
+      id: timestamp_align
+      position:
+        x: 1580
+        y: 280
+    - data:
+        type: code
+        title: 规则降噪
+        desc: 去除填充词、重复内容、离题片段
+        variables:
+        - value_selector:
+          - timestamp_align
+          - aligned_json
+          variable: aligned_json
+        code_language: python3
+        code: |
+          import json
+          import re
+
+          FILLER_PATTERNS_ZH = [
+              r'[嗯啊呃哦额那个就是然后这个对吧是吧]{1,3}(?=[，。、\s])',
+              r'(?:那个|这个|就是说|怎么说呢|对不对|是不是)',
+          ]
+          FILLER_PATTERNS_EN = [
+              r'\b(?:uh|um|er|ah|like|you know|I mean|basically|actually|so yeah)\b',
+          ]
+
+          def remove_fillers(text: str) -> str:
+              for pat in FILLER_PATTERNS_ZH + FILLER_PATTERNS_EN:
+                  text = re.sub(pat, '', text, flags=re.IGNORECASE)
+              text = re.sub(r'\s{2,}', ' ', text)
+              text = re.sub(r'[，。]{2,}', '。', text)
+              return text.strip()
+
+          def is_repetitive(text: str, prev_text: str, threshold: float = 0.7) -> bool:
+              if not prev_text or not text:
+                  return False
+              words_a = set(text)
+              words_b = set(prev_text)
+              if not words_a or not words_b:
+                  return False
+              overlap = len(words_a & words_b) / max(len(words_a), len(words_b))
+              return overlap > threshold
+
+          def is_off_topic(text: str) -> bool:
+              off_topic_markers = [
+                  r'(?:广告|赞助|关注|订阅|点赞|转发|评论区)',
+                  r'(?:subscribe|like and share|hit the bell)',
+                  r'(?:稍等一下|我们休息|中场休息|等一下)',
+              ]
+              for pat in off_topic_markers:
+                  if re.search(pat, text, re.IGNORECASE):
+                      return True
+              return False
+
+          def main(aligned_json: str) -> dict:
+              segments = json.loads(aligned_json)
+              cleaned = []
+              prev_text = ""
+
+              for seg in segments:
+                  text = seg.get("transcript", "")
+                  text = remove_fillers(text)
+                  if len(text) < 5:
+                      continue
+                  if is_off_topic(text):
+                      continue
+                  if is_repetitive(text, prev_text):
+                      continue
+                  seg["transcript"] = text
+                  cleaned.append(seg)
+                  prev_text = text
+
+              return {
+                  "cleaned_json": json.dumps(cleaned, ensure_ascii=False),
+              }
+        outputs:
+          cleaned_json:
+            type: string
+      id: denoise
+      position:
+        x: 1880
+        y: 280
+    - data:
+        type: llm
+        title: 知识点提取
+        desc: 融合音频转录与视觉内容，提取结构化知识点
+        model:
+          provider: deepseek
+          name: deepseek-chat
+          mode: chat
+          completion_params:
+            temperature: 0.3
+            max_tokens: 8192
+        prompt_template:
+        - role: system
+          text: |
+            你是一个专业的知识提取专家。你的任务是从视频的音频转录文本和视觉内容中提取结构化的知识点。
+
+            ## 提取规则
+
+            1. 每个知识点必须是独立的、完整的知识单元
+            2. 知识点应包含：标题、详细内容、来源时间段、置信度
+            3. 优先提取：定义、原理、步骤、对比、因果关系、最佳实践
+            4. 当视觉内容（PPT/白板文字）与语音内容互补时，融合两者信息
+            5. 当视觉内容与语音内容矛盾时，以视觉内容（PPT 文字）为准
+            6. 保留原始术语和专有名词，不要过度概括
+
+            ## 输出格式
+
+            输出严格的 JSON 数组：
+            ```json
+            [
+              {
+                "id": "kp_001",
+                "title": "知识点标题",
+                "content": "详细内容描述，包含关键细节",
+                "category": "concept|procedure|comparison|best_practice|definition|example",
+                "tags": ["标签1", "标签2"],
+                "source_segments": [0, 1],
+                "time_range": {"start_ms": 0, "end_ms": 60000},
+                "evidence": {
+                  "from_audio": "相关转录文本片段",
+                  "from_visual": "相关视觉内容",
+                  "fusion_note": "融合说明"
+                },
+                "confidence": 0.9
+              }
+            ]
+            ```
+        - role: user
+          text: |
+            视频标题：{{#parse_manifest.video_title#}}
+
+            以下是经过降噪处理的视频内容数据，每个段落包含转录文本和对应的视觉分析结果：
+
+            {{#denoise.cleaned_json#}}
+
+            请从以上内容中提取所有有价值的知识点，以 JSON 数组格式输出。
+        variables:
+        - value_selector:
+          - denoise
+          - cleaned_json
+          variable: cleaned_json
+        - value_selector:
+          - parse_manifest
+          - video_title
+          variable: video_title
+        memory:
+        context:
+          enabled: false
+      id: knowledge_extract
+      position:
+        x: 2180
+        y: 280
+    - data:
+        type: code
+        title: 去重与聚合
+        desc: 合并相似知识点，去除重复项
+        variables:
+        - value_selector:
+          - knowledge_extract
+          - text
+          variable: knowledge_points_text
+        code_language: python3
+        code: |
+          import json
+          import re
+
+          def jaccard_similarity(a: str, b: str) -> float:
+              set_a = set(a)
+              set_b = set(b)
+              if not set_a or not set_b:
+                  return 0.0
+              return len(set_a & set_b) / len(set_a | set_b)
+
+          def merge_knowledge_points(kp1: dict, kp2: dict) -> dict:
+              merged = dict(kp1)
+              if len(kp2.get("content", "")) > len(kp1.get("content", "")):
+                  merged["content"] = kp2["content"]
+              tags1 = set(kp1.get("tags", []))
+              tags2 = set(kp2.get("tags", []))
+              merged["tags"] = list(tags1 | tags2)
+              segs1 = set(kp1.get("source_segments", []))
+              segs2 = set(kp2.get("source_segments", []))
+              merged["source_segments"] = sorted(list(segs1 | segs2))
+              c1 = kp1.get("confidence", 0)
+              c2 = kp2.get("confidence", 0)
+              merged["confidence"] = max(c1, c2)
+              merged["merged_from"] = [kp1.get("id", ""), kp2.get("id", "")]
+              return merged
+
+          def main(knowledge_points_text: str) -> dict:
+              json_match = re.search(r'\[.*\]', knowledge_points_text, re.DOTALL)
+              if not json_match:
+                  return {"deduplicated_json": "[]", "knowledge_count": 0}
+              kps = json.loads(json_match.group())
+
+              SIMILARITY_THRESHOLD = 0.6
+              merged_flags = [False] * len(kps)
+              result = []
+
+              for i in range(len(kps)):
+                  if merged_flags[i]:
+                      continue
+                  current = dict(kps[i])
+                  for j in range(i + 1, len(kps)):
+                      if merged_flags[j]:
+                          continue
+                      title_sim = jaccard_similarity(
+                          current.get("title", ""),
+                          kps[j].get("title", "")
+                      )
+                      content_sim = jaccard_similarity(
+                          current.get("content", ""),
+                          kps[j].get("content", "")
+                      )
+                      if title_sim > SIMILARITY_THRESHOLD or content_sim > SIMILARITY_THRESHOLD:
+                          current = merge_knowledge_points(current, kps[j])
+                          merged_flags[j] = True
+                  current["id"] = f"kp_{len(result)+1:03d}"
+                  result.append(current)
+
+              return {
+                  "deduplicated_json": json.dumps(result, ensure_ascii=False),
+                  "knowledge_count": len(result),
+              }
+        outputs:
+          deduplicated_json:
+            type: string
+          knowledge_count:
+            type: number
+      id: dedup_aggregate
+      position:
+        x: 2480
+        y: 280
+    - data:
+        type: llm
+        title: 最终润色
+        desc: 使用 DeepSeek 润色和格式化最终输出
+        model:
+          provider: deepseek
+          name: deepseek-chat
+          mode: chat
+          completion_params:
+            temperature: 0.4
+            max_tokens: 8192
+        prompt_template:
+        - role: system
+          text: |
+            你是一个专业的知识整理编辑。你的任务是将提取的知识点润色为高质量的结构化文档。
+
+            ## 润色规则
+
+            1. 保持知识点的准确性，不添加原文中没有的信息
+            2. 改善表述的流畅性和专业性
+            3. 统一术语和格式
+            4. 为每个知识点补充适当的上下文说明
+            5. 按照逻辑关系重新组织知识点的顺序
+            6. 添加知识点之间的关联说明
+
+            ## 输出格式
+
+            输出 JSON 对象：
+            ```json
+            {
+              "title": "文档标题",
+              "summary": "整体摘要（200字以内）",
+              "knowledge_points": [
+                {
+                  "id": "kp_001",
+                  "title": "润色后的标题",
+                  "content": "润色后的详细内容",
+                  "category": "分类",
+                  "tags": ["标签"],
+                  "time_range": {"start_ms": 0, "end_ms": 0},
+                  "related_points": ["kp_002"],
+                  "importance": "high|medium|low"
+                }
+              ],
+              "topic_outline": [
+                {"topic": "主题1", "point_ids": ["kp_001", "kp_002"]}
+              ],
+              "total_duration_ms": 0
+            }
+            ```
+        - role: user
+          text: |
+            视频标题：{{#parse_manifest.video_title#}}
+            视频时长：{{#parse_manifest.video_duration#}} 秒
+
+            以下是去重后的知识点数据：
+            {{#dedup_aggregate.deduplicated_json#}}
+
+            请润色以上知识点并按照指定格式输出。
+        variables:
+        - value_selector:
+          - dedup_aggregate
+          - deduplicated_json
+          variable: deduplicated_json
+        - value_selector:
+          - parse_manifest
+          - video_title
+          variable: video_title
+        - value_selector:
+          - parse_manifest
+          - video_duration
+          variable: video_duration
+        memory:
+        context:
+          enabled: false
+      id: final_polish
+      position:
+        x: 2780
+        y: 280
+    - data:
+        type: code
+        title: 多格式输出
+        desc: 生成 Markdown、JSON、SRT、HTML 格式
+        variables:
+        - value_selector:
+          - final_polish
+          - text
+          variable: polished_text
+        - value_selector:
+          - dedup_aggregate
+          - deduplicated_json
+          variable: deduplicated_json
+        - value_selector:
+          - parse_manifest
+          - video_title
+          variable: video_title
+        code_language: python3
+        code: |
+          import json
+          import re
+
+          def ms_to_srt_time(ms: int) -> str:
+              h = ms // 3600000
+              m = (ms % 3600000) // 60000
+              s = (ms % 60000) // 1000
+              mil = ms % 1000
+              return f"{h:02d}:{m:02d}:{s:02d},{mil:03d}"
+
+          def ms_to_readable(ms: int) -> str:
+              h = ms // 3600000
+              m = (ms % 3600000) // 60000
+              s = (ms % 60000) // 1000
+              if h > 0:
+                  return f"{h:02d}:{m:02d}:{s:02d}"
+              return f"{m:02d}:{s:02d}"
+
+          def main(polished_text: str, deduplicated_json: str, video_title: str) -> dict:
+              json_match = re.search(r'\{.*\}', polished_text, re.DOTALL)
+              if json_match:
+                  doc = json.loads(json_match.group())
+              else:
+                  doc = {"title": video_title, "summary": "", "knowledge_points": [], "topic_outline": []}
+
+              kps = doc.get("knowledge_points", [])
+              title = doc.get("title", video_title)
+              summary = doc.get("summary", "")
+              outline = doc.get("topic_outline", [])
+
+              # --- Markdown ---
+              md_lines = [f"# {title}", "", f"> {summary}", ""]
+              if outline:
+                  md_lines.append("## 目录")
+                  for t in outline:
+                      md_lines.append(f"- {t.get('topic', '')}")
+                  md_lines.append("")
+              md_lines.append("## 知识点")
+              md_lines.append("")
+              for kp in kps:
+                  tr = kp.get("time_range", {})
+                  ts_str = ms_to_readable(tr.get("start_ms", 0))
+                  imp = kp.get("importance", "medium")
+                  imp_badge = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(imp, "")
+                  md_lines.append(f"### {imp_badge} {kp.get('title', '')} [{ts_str}]")
+                  md_lines.append("")
+                  md_lines.append(kp.get("content", ""))
+                  md_lines.append("")
+                  tags = kp.get("tags", [])
+                  if tags:
+                      md_lines.append("**标签**: " + ", ".join(f"`{t}`" for t in tags))
+                      md_lines.append("")
+              markdown_output = "\n".join(md_lines)
+
+              # --- JSON ---
+              json_output = json.dumps(doc, ensure_ascii=False, indent=2)
+
+              # --- SRT ---
+              srt_lines = []
+              for i, kp in enumerate(kps, 1):
+                  tr = kp.get("time_range", {})
+                  start = tr.get("start_ms", 0)
+                  end = tr.get("end_ms", start + 30000)
+                  srt_lines.append(str(i))
+                  srt_lines.append(f"{ms_to_srt_time(start)} --> {ms_to_srt_time(end)}")
+                  srt_lines.append(f"[{kp.get('title', '')}] {kp.get('content', '')[:100]}")
+                  srt_lines.append("")
+              srt_output = "\n".join(srt_lines)
+
+              # --- HTML ---
+              html_parts = [
+                  "<!DOCTYPE html>",
+                  '<html lang="zh-CN"><head><meta charset="UTF-8">',
+                  f"<title>{title}</title>",
+                  "<style>",
+                  "body{font-family:system-ui,sans-serif;max-width:900px;margin:0 auto;padding:2rem;color:#333;line-height:1.6}",
+                  "h1{border-bottom:2px solid #667eea;padding-bottom:.5rem}",
+                  ".summary{background:#f0f4ff;padding:1rem;border-radius:8px;margin:1rem 0}",
+                  ".kp{border-left:4px solid #667eea;padding:1rem;margin:1rem 0;background:#fafbff;border-radius:0 8px 8px 0}",
+                  ".kp h3{margin:0 0 .5rem}.tag{display:inline-block;background:#e8ecff;padding:2px 8px;border-radius:12px;font-size:.85em;margin:2px}",
+                  ".time{color:#888;font-size:.85em}.high{border-left-color:#e53e3e}.low{border-left-color:#38a169}",
+                  "</style></head><body>",
+                  f"<h1>{title}</h1>",
+                  f'<div class="summary">{summary}</div>',
+              ]
+              for kp in kps:
+                  imp = kp.get("importance", "medium")
+                  tr = kp.get("time_range", {})
+                  ts = ms_to_readable(tr.get("start_ms", 0))
+                  html_parts.append(f'<div class="kp {imp}">')
+                  html_parts.append(f'<h3>{kp.get("title","")}</h3>')
+                  html_parts.append(f'<span class="time">{ts}</span>')
+                  html_parts.append(f'<p>{kp.get("content","")}</p>')
+                  tags = kp.get("tags", [])
+                  if tags:
+                      html_parts.append('<div>' + ''.join(f'<span class="tag">{t}</span>' for t in tags) + '</div>')
+                  html_parts.append('</div>')
+              html_parts.append("</body></html>")
+              html_output = "\n".join(html_parts)
+
+              return {
+                  "markdown_output": markdown_output,
+                  "json_output": json_output,
+                  "srt_output": srt_output,
+                  "html_output": html_output,
+              }
+        outputs:
+          markdown_output:
+            type: string
+          json_output:
+            type: string
+          srt_output:
+            type: string
+          html_output:
+            type: string
+      id: multi_format_output
+      position:
+        x: 3080
+        y: 280
+    - data:
+        type: end
+        title: 结束
+        outputs:
+        - value_selector:
+          - multi_format_output
+          - markdown_output
+          variable: markdown_output
+        - value_selector:
+          - multi_format_output
+          - json_output
+          variable: json_output
+        - value_selector:
+          - multi_format_output
+          - srt_output
+          variable: srt_output
+        - value_selector:
+          - multi_format_output
+          - html_output
+          variable: html_output
+      id: end
+      position:
+        x: 3380
+        y: 280
+  hash: video-knowledge-extractor-v1
