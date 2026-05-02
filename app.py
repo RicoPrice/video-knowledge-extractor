@@ -182,20 +182,38 @@ async def run_pipeline(task_id: str, video_path: str):
         video_name = task["video_name"]
         out_dir = str(OUTPUT_DIR / video_name)
 
-        await db.update_task(task_id, stage="提取音频 + 场景检测", progress=10)
+        await db.update_task(task_id, stage="提取音频", progress=10)
         proc = await asyncio.create_subprocess_exec(
-            str(BASE_DIR / "venv" / "bin" / "python3"),
+            str(BASE_DIR / "venv" / "bin" / "python3"), "-u",
             str(BASE_DIR / "preprocess.py"),
             video_path,
             "-c", str(BASE_DIR / "config.yaml"),
             "-o", out_dir,
             "--skip-oss",
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
-        stdout, stderr = await proc.communicate()
+        # 逐行读取输出，根据关键词更新进度
+        output_lines = []
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode(errors="replace").strip()
+            output_lines.append(text)
+            if "audio" in text.lower() or "ffmpeg" in text.lower():
+                await db.update_task(task_id, stage="提取音频", progress=15)
+            elif "scene" in text.lower() or "detect" in text.lower():
+                await db.update_task(task_id, stage="场景检测", progress=20)
+            elif "hash" in text.lower() or "phash" in text.lower() or "dedup" in text.lower():
+                await db.update_task(task_id, stage="关键帧去重", progress=28)
+            elif "ppt" in text.lower() or "filter" in text.lower():
+                await db.update_task(task_id, stage="PPT 过滤", progress=32)
+            elif "manifest" in text.lower() or "done" in text.lower():
+                await db.update_task(task_id, stage="生成 Manifest", progress=38)
+        await proc.wait()
         if proc.returncode != 0:
-            raise RuntimeError(f"预处理失败: {stderr.decode()[-500:]}")
+            raise RuntimeError(f"预处理失败: {chr(10).join(output_lines[-10:])}")
 
         await db.update_task(task_id, stage="预处理完成", progress=40)
 
