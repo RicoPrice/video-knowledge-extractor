@@ -11,10 +11,9 @@ venv/
 # Config with secrets
 config.yaml
 
+# Logs
+*.log
+
 # OS
 .DS_Store
 Thumbs.db
-
-# Logs
-*.log
-web.log
