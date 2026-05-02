@@ -28,6 +28,7 @@ app = FastAPI(title="视频知识点提取平台")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 app.mount("/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 # Background task registry
 _running_tasks: dict[str, asyncio.Task] = {}
@@ -60,7 +61,16 @@ async def task_detail_page(request: Request, task_id: str):
     task = await db.get_task(task_id)
     if not task:
         return HTMLResponse("任务不存在", status_code=404)
-    return templates.TemplateResponse("task.html", {"request": request, "task": task})
+    # 构建视频的 Web 路径
+    video_web_path = ""
+    vp = task.get("video_path", "")
+    if vp:
+        from urllib.parse import quote
+        # video_path 格式: /home/rico/.../uploads/{task_id}/filename.mp4
+        rel = Path(vp)
+        if rel.exists():
+            video_web_path = f"/uploads/{quote(task_id)}/{quote(rel.name)}"
+    return templates.TemplateResponse("task.html", {"request": request, "task": task, "video_web_path": video_web_path})
 
 
 # ── API ───────────────────────────────────────────

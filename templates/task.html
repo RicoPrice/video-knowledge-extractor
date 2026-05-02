@@ -13,7 +13,7 @@
   .prose p { margin: 0.5rem 0; line-height: 1.8; }
   .prose ul, .prose ol { margin: 0.5rem 0; padding-left: 1.5rem; }
   .prose li { margin: 0.3rem 0; line-height: 1.7; }
-  .prose table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+  .prose table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.9rem; }
   .prose th, .prose td { border: 1px solid #e5e7eb; padding: 0.5rem 0.75rem; text-align: left; }
   .prose th { background: #f9fafb; font-weight: 600; }
   .prose blockquote { border-left: 3px solid #d1d5db; padding-left: 1rem; color: #6b7280; margin: 1rem 0; }
@@ -23,23 +23,46 @@
   .prose hr { border: none; border-top: 1px solid #e5e7eb; margin: 1.5rem 0; }
   .prose img {
     max-width: 100%;
+    max-height: 400px;
     border-radius: 0.5rem;
     border: 1px solid #e5e7eb;
     margin: 0.75rem 0;
     box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    cursor: pointer;
   }
+  .prose img:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
   .prose strong { color: #1f2937; }
   .tab-active { border-bottom: 2px solid #6366f1; color: #4338ca; }
+  .ts-link { color: #4f46e5; cursor: pointer; text-decoration: underline; font-family: monospace; }
+  .ts-link:hover { color: #3730a3; }
+  #video-player { position: sticky; top: 0; z-index: 10; }
+  #lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 50; cursor: pointer; align-items: center; justify-content: center; }
+  #lightbox img { max-width: 90vw; max-height: 90vh; border-radius: 0.5rem; }
+  #lightbox.active { display: flex; }
 </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
+
+<!-- Lightbox for image zoom -->
+<div id="lightbox" onclick="this.classList.remove('active')">
+  <img id="lightbox-img" src="" alt="">
+</div>
 
 <nav class="bg-white border-b px-6 py-3 flex items-center gap-4">
   <a href="/" class="text-gray-400 hover:text-gray-600 text-sm">&larr; 返回</a>
   <h1 class="text-base font-semibold text-gray-800">{{ task.video_name }}</h1>
 </nav>
 
-<main class="max-w-4xl mx-auto px-4 py-6">
+<main class="max-w-5xl mx-auto px-4 py-6">
+
+  <!-- Video Player -->
+  {% if video_web_path %}
+  <div id="video-player" class="mb-6 bg-black rounded-lg overflow-hidden">
+    <video id="vid" controls preload="metadata" class="w-full" style="max-height: 400px;">
+      <source src="{{ video_web_path }}" type="video/mp4">
+    </video>
+  </div>
+  {% endif %}
 
   <!-- Info bar -->
   <div class="flex items-center justify-between mb-6">
@@ -83,26 +106,50 @@
 const md = {{ task.report_markdown | tojson }};
 const rj = {{ task.report_json | tojson }};
 const manifest = {{ task.manifest_json | tojson }};
+const hasVideo = !!document.getElementById('vid');
 
-// Render markdown with image support
+// Custom renderer
 const renderer = new marked.Renderer();
+
+// Images: clickable lightbox
 renderer.image = function({href, title, text}) {
-  // Handle broken images gracefully
-  return `<img src="${href}" alt="${text || ''}" title="${title || ''}" loading="lazy" onerror="this.style.display='none'">`;
+  return `<img src="${href}" alt="${text || ''}" title="${title || text || ''}" loading="lazy"
+    onclick="document.getElementById('lightbox-img').src=this.src; document.getElementById('lightbox').classList.add('active')"
+    onerror="this.style.display='none'">`;
 };
+
+// Convert ⏱️ timestamps to clickable links that seek the video
+const origParagraph = renderer.paragraph;
+renderer.paragraph = function({text, tokens}) {
+  let html = typeof text === 'string' ? text : this.parser.parseInline(tokens);
+  if (hasVideo) {
+    // Match patterns like ⏱️ **1:23 - 4:56** or **0:00:12 - 0:05:30**
+    html = html.replace(/(\d{1,2}:\d{2}(?::\d{2})?)\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?)/g, (match, start, end) => {
+      const startSec = tsToSec(start);
+      const endSec = tsToSec(end);
+      return `<span class="ts-link" onclick="seekTo(${startSec})" title="跳转到 ${start}">${start}</span> - <span class="ts-link" onclick="seekTo(${endSec})" title="跳转到 ${end}">${end}</span>`;
+    });
+  }
+  return `<p>${html}</p>\n`;
+};
+
 marked.setOptions({ renderer: renderer, breaks: true });
 
 document.getElementById('content-preview').innerHTML = marked.parse(md || '*报告尚未生成*');
 document.getElementById('content-raw').textContent = md || '';
-try {
-  document.getElementById('content-json').textContent = rj ? JSON.stringify(JSON.parse(rj), null, 2) : '';
-} catch(e) {
-  document.getElementById('content-json').textContent = rj || '';
+try { document.getElementById('content-json').textContent = rj ? JSON.stringify(JSON.parse(rj), null, 2) : ''; } catch(e) { document.getElementById('content-json').textContent = rj || ''; }
+try { document.getElementById('content-manifest').textContent = manifest ? JSON.stringify(JSON.parse(manifest), null, 2) : ''; } catch(e) { document.getElementById('content-manifest').textContent = manifest || ''; }
+
+function tsToSec(ts) {
+  const parts = ts.split(':').map(Number);
+  if (parts.length === 3) return parts[0]*3600 + parts[1]*60 + parts[2];
+  if (parts.length === 2) return parts[0]*60 + parts[1];
+  return 0;
 }
-try {
-  document.getElementById('content-manifest').textContent = manifest ? JSON.stringify(JSON.parse(manifest), null, 2) : '';
-} catch(e) {
-  document.getElementById('content-manifest').textContent = manifest || '';
+
+function seekTo(sec) {
+  const vid = document.getElementById('vid');
+  if (vid) { vid.currentTime = sec; vid.play(); vid.scrollIntoView({behavior:'smooth', block:'start'}); }
 }
 
 function showTab(name) {

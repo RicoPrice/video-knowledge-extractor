@@ -388,7 +388,8 @@ def generate_markdown(video_name: str, knowledge: dict, visual_results: list[dic
             for fi in related_frames[:3]:  # 最多 3 张
                 kf = frame_map.get(fi)
                 if kf and kf.get("filename"):
-                    img_path = f"/output/{video_name}/keyframes/{kf['filename']}"
+                    from urllib.parse import quote
+                    img_path = f"/output/{quote(video_name)}/keyframes/{quote(kf['filename'])}"
                     lines.append(f"![帧{fi} ({_sec_to_ts(kf.get('timestamp', 0))})]({img_path})\n")
 
         # 正文内容
