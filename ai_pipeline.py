@@ -64,16 +64,20 @@ async def transcribe_audio(audio_path: str, api_key: str) -> dict:
         dashscope.api_key = api_key
 
         # Step 1: 用 SDK 上传文件到 DashScope 临时 OSS
-        log.info("上传音频到 DashScope: %s (%.1fMB)", upload_path, os.path.getsize(upload_path) / 1024 / 1024)
-        file_urls = await asyncio.to_thread(
+        log.info("上传音频到 DashScope OSS: %s (%.1fMB)", upload_path, os.path.getsize(upload_path) / 1024 / 1024)
+        oss_url = await asyncio.to_thread(dashscope.OssUtils.upload, upload_path)
+        if not oss_url:
+            raise RuntimeError(f"音频上传到 OSS 失败，返回空 URL")
+        log.info("音频已上传: %s", oss_url[:80])
+
+        # Step 2: 提交异步转写任务
+        task_response = await asyncio.to_thread(
             Transcription.async_call,
             model="paraformer-v2",
-            file_urls=[upload_path],
+            file_urls=[oss_url],
             language_hints=["zh", "en"],
         )
 
-        # async_call 返回的是一个 task response
-        task_response = file_urls
         task_id = ""
         if hasattr(task_response, "output") and task_response.output:
             task_id = task_response.output.get("task_id", "")
@@ -81,22 +85,16 @@ async def transcribe_audio(audio_path: str, api_key: str) -> dict:
             raise RuntimeError(f"ASR 提交失败: {task_response}")
         log.info("ASR 任务已提交: %s", task_id)
 
-        # Step 2: 轮询等待结果
-        for _ in range(180):  # 最多等 15 分钟
-            await asyncio.sleep(5)
-            result = await asyncio.to_thread(Transcription.fetch, task_id)
-            status = ""
-            if hasattr(result, "output") and result.output:
-                status = result.output.get("task_status", "")
-            if status == "SUCCEEDED":
-                break
-            elif status == "FAILED":
-                raise RuntimeError(f"ASR 失败: {result.output}")
-            log.info("ASR 进行中... (%s)", status)
-        else:
-            raise TimeoutError("ASR 超时（15分钟）")
+        # Step 3: 用 SDK 的 wait 方法等待结果
+        result = await asyncio.to_thread(Transcription.wait, task=task_id)
+        if not hasattr(result, "output") or not result.output:
+            raise RuntimeError(f"ASR 返回无效结果: {result}")
 
-        # Step 3: 解析结果
+        task_status = result.output.get("task_status", "")
+        if task_status != "SUCCEEDED":
+            raise RuntimeError(f"ASR 失败: {json.dumps(result.output, ensure_ascii=False)}")
+
+        # Step 4: 解析结果
         transcription_results = result.output.get("results", [])
         segments = []
         full_text_parts = []
