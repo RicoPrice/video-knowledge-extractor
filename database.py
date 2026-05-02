@@ -16,6 +16,7 @@ async def init_db():
                 id TEXT PRIMARY KEY,
                 video_name TEXT NOT NULL,
                 video_path TEXT,
+                file_hash TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 progress INTEGER DEFAULT 0,
                 stage TEXT DEFAULT '',
@@ -32,12 +33,12 @@ async def init_db():
         await db.commit()
 
 
-async def create_task(task_id: str, video_name: str, video_path: str) -> dict:
+async def create_task(task_id: str, video_name: str, video_path: str, file_hash: str = "") -> dict:
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO tasks (id, video_name, video_path, status, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?)",
-            (task_id, video_name, video_path, now, now),
+            "INSERT INTO tasks (id, video_name, video_path, file_hash, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+            (task_id, video_name, video_path, file_hash, now, now),
         )
         await db.commit()
     return {"id": task_id, "video_name": video_name, "status": "pending", "created_at": now}
@@ -74,3 +75,15 @@ async def delete_task(task_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         await db.commit()
+
+
+async def find_by_hash(file_hash: str) -> dict | None:
+    """查找相同文件哈希的已有任务"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM tasks WHERE file_hash = ? ORDER BY created_at DESC LIMIT 1",
+            (file_hash,),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None

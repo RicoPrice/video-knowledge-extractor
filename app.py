@@ -1,6 +1,7 @@
 """Web App — 视频知识点提取平台"""
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -88,13 +89,30 @@ async def api_upload(file: UploadFile = File(...)):
     task_dir.mkdir(parents=True, exist_ok=True)
     video_path = task_dir / file.filename
 
+    # 边写入边计算 SHA-256
+    sha = hashlib.sha256()
     with open(video_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        while chunk := await file.read(1024 * 1024):
+            f.write(chunk)
+            sha.update(chunk)
+    file_hash = sha.hexdigest()
 
-    await db.create_task(task_id, video_name, str(video_path))
+    # 检查是否有相同文件的已有任务
+    existing = await db.find_by_hash(file_hash)
+    if existing:
+        # 清理刚上传的文件
+        shutil.rmtree(task_dir)
+        return JSONResponse({
+            "task_id": existing["id"],
+            "video_name": existing["video_name"],
+            "duplicate": True,
+            "status": existing["status"],
+        })
+
+    await db.create_task(task_id, video_name, str(video_path), file_hash)
     bg = asyncio.create_task(run_pipeline(task_id, str(video_path)))
     _running_tasks[task_id] = bg
-    return {"task_id": task_id, "video_name": video_name}
+    return {"task_id": task_id, "video_name": video_name, "duplicate": False}
 
 
 @app.delete("/api/tasks/{task_id}")
