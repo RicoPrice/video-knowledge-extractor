@@ -89,7 +89,8 @@ async function uploadFile(file) {
     if (xhr.status === 200) {
       const data = JSON.parse(xhr.responseText);
       if (data.duplicate) {
-        uploadPct.textContent = '已有相同视频';
+        const msg = data.status === 'completed' ? '已有相同视频（已完成）' : '相同视频正在处理中';
+        uploadPct.textContent = msg;
         uploadBar.style.width = '100%';
         uploadBar.classList.remove('bg-indigo-500');
         uploadBar.classList.add('bg-yellow-400');
@@ -97,11 +98,11 @@ async function uploadFile(file) {
           uploadProgress.classList.add('hidden');
           uploadBar.classList.remove('bg-yellow-400');
           uploadBar.classList.add('bg-indigo-500');
-        }, 2000);
+        }, 2500);
       } else {
-        uploadPct.textContent = '已提交';
+        uploadPct.textContent = '已提交，开始处理';
       }
-      setTimeout(() => { uploadProgress.classList.add('hidden'); }, 2500);
+      setTimeout(() => { uploadProgress.classList.add('hidden'); }, 3000);
       loadTasks();
     } else {
       uploadPct.textContent = '上传失败';

@@ -101,14 +101,33 @@ async def api_upload(file: UploadFile = File(...)):
     # 检查是否有相同文件的已有任务
     existing = await db.find_by_hash(file_hash)
     if existing:
-        # 清理刚上传的文件
-        shutil.rmtree(task_dir)
-        return JSONResponse({
-            "task_id": existing["id"],
-            "video_name": existing["video_name"],
-            "duplicate": True,
-            "status": existing["status"],
-        })
+        if existing["status"] == "completed":
+            # 已完成：跳过上传，直接返回旧任务
+            shutil.rmtree(task_dir)
+            return JSONResponse({
+                "task_id": existing["id"],
+                "video_name": existing["video_name"],
+                "duplicate": True,
+                "status": existing["status"],
+            })
+        elif existing["status"] in ("failed", "cancelled"):
+            # 失败/取消：删除旧任务，用旧文件路径重新处理
+            old_id = existing["id"]
+            old_video_path = existing.get("video_path", "")
+            await db.delete_task(old_id)
+            old_upload = UPLOAD_DIR / old_id
+            if old_upload.exists():
+                shutil.rmtree(old_upload)
+            # 用新任务继续
+        elif existing["status"] in ("pending", "processing"):
+            # 正在处理中：跳过，返回当前任务
+            shutil.rmtree(task_dir)
+            return JSONResponse({
+                "task_id": existing["id"],
+                "video_name": existing["video_name"],
+                "duplicate": True,
+                "status": existing["status"],
+            })
 
     await db.create_task(task_id, video_name, str(video_path), file_hash)
     bg = asyncio.create_task(run_pipeline(task_id, str(video_path)))
