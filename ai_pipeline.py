@@ -63,18 +63,26 @@ async def transcribe_audio(audio_path: str, api_key: str) -> dict:
         from dashscope.audio.asr import Transcription
         dashscope.api_key = api_key
 
-        # Step 1: 用 SDK 上传文件到 DashScope 临时 OSS
-        log.info("上传音频到 DashScope OSS: %s (%.1fMB)", upload_path, os.path.getsize(upload_path) / 1024 / 1024)
-        oss_url = await asyncio.to_thread(dashscope.OssUtils.upload, upload_path)
-        if not oss_url:
-            raise RuntimeError(f"音频上传到 OSS 失败，返回空 URL")
-        log.info("音频已上传: %s", oss_url[:80])
+        # Step 1: 用 SDK 上传文件到 DashScope
+        log.info("上传音频到 DashScope: %s (%.1fMB)", upload_path, os.path.getsize(upload_path) / 1024 / 1024)
+        upload_resp = await asyncio.to_thread(
+            dashscope.Files.upload, upload_path, "file-extract"
+        )
+        if upload_resp.status_code != 200:
+            raise RuntimeError(f"音频上传失败: HTTP {upload_resp.status_code} {upload_resp}")
+        uploaded = upload_resp.output.get("uploaded_files", [])
+        if not uploaded:
+            failed = upload_resp.output.get("failed_uploads", [])
+            raise RuntimeError(f"音频上传失败: {failed}")
+        file_id = uploaded[0]["file_id"]
+        file_url = f"fileid://{file_id}"
+        log.info("音频已上传: %s", file_url)
 
         # Step 2: 提交异步转写任务
         task_response = await asyncio.to_thread(
             Transcription.async_call,
             model="paraformer-v2",
-            file_urls=[oss_url],
+            file_urls=[file_url],
             language_hints=["zh", "en"],
         )
 
