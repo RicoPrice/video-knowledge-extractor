@@ -30,98 +30,127 @@ def _load_config() -> dict:
 async def transcribe_audio(audio_path: str, api_key: str) -> dict:
     """
     调用阿里云百炼 Paraformer-v2 进行语音转写。
-    先上传音频到 DashScope 文件服务，再提交异步转写任务。
+    大 WAV 文件先压缩成 MP3 再上传。
     返回 {"text": "全文", "segments": [{"start": 0.0, "end": 1.5, "text": "..."}]}
     """
     log.info("ASR 转写: %s", audio_path)
 
-    # Step 0: 上传音频文件到 DashScope
-    log.info("上传音频到 DashScope...")
-    async with httpx.AsyncClient(timeout=300) as client:
-        with open(audio_path, "rb") as f:
-            resp = await client.post(
-                "https://dashscope.aliyuncs.com/api/v1/uploads",
-                headers={"Authorization": f"Bearer {api_key}"},
-                files={"file": (os.path.basename(audio_path), f, "audio/wav")},
-                data={"purpose": "file-extract"},
-            )
-        resp.raise_for_status()
-        upload_data = resp.json()
-        file_url = upload_data.get("data", {}).get("uploaded_url", "")
-        if not file_url:
-            # 备选：尝试从 id 构造
-            file_id = upload_data.get("data", {}).get("file_id") or upload_data.get("id", "")
-            file_url = f"dashscope://file-{file_id}" if file_id else ""
-        if not file_url:
-            raise RuntimeError(f"音频上传失败: {upload_data}")
-        log.info("音频已上传: %s", file_url[:80])
-
-    # Step 1: 提交转写任务
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            "https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "X-DashScope-Async": "enable",
-            },
-            json={
-                "model": "paraformer-v2",
-                "input": {"file_urls": [file_url]},
-                "parameters": {
-                    "language_hints": ["zh", "en"],
-                },
-            },
+    # Step 0: 如果是 WAV 且 > 50MB，先转 MP3
+    upload_path = audio_path
+    tmp_mp3 = None
+    file_size = os.path.getsize(audio_path)
+    if file_size > 50 * 1024 * 1024 and audio_path.lower().endswith(".wav"):
+        tmp_mp3 = audio_path.rsplit(".", 1)[0] + "_asr.mp3"
+        log.info("音频 %.0fMB 太大，转换为 MP3...", file_size / 1024 / 1024)
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", audio_path,
+            "-ac", "1", "-ar", "16000", "-b:a", "64k",
+            tmp_mp3,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-        resp.raise_for_status()
-        task_data = resp.json()
-        task_id = task_data.get("output", {}).get("task_id", "")
-        if not task_id:
-            raise RuntimeError(f"ASR 提交失败: {task_data}")
-        log.info("ASR 任务已提交: %s", task_id)
+        await proc.wait()
+        if proc.returncode == 0 and os.path.exists(tmp_mp3):
+            upload_path = tmp_mp3
+            log.info("MP3 转换完成: %.1fMB", os.path.getsize(tmp_mp3) / 1024 / 1024)
+        else:
+            log.warning("MP3 转换失败，使用原始 WAV")
+            tmp_mp3 = None
 
-    # Step 2: 轮询结果
-    async with httpx.AsyncClient(timeout=30) as client:
-        for _ in range(120):  # 最多等 10 分钟
-            await asyncio.sleep(5)
-            resp = await client.get(
-                f"https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}",
-                headers={"Authorization": f"Bearer {api_key}"},
+    try:
+        # Step 1: 上传音频文件到 DashScope
+        log.info("上传音频到 DashScope: %s", upload_path)
+        mime = "audio/mpeg" if upload_path.endswith(".mp3") else "audio/wav"
+        async with httpx.AsyncClient(timeout=600) as client:
+            with open(upload_path, "rb") as f:
+                resp = await client.post(
+                    "https://dashscope.aliyuncs.com/api/v1/uploads",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    files={"file": (os.path.basename(upload_path), f, mime)},
+                    data={"purpose": "file-extract"},
+                )
+            resp.raise_for_status()
+            upload_data = resp.json()
+            file_url = upload_data.get("data", {}).get("uploaded_url", "")
+            if not file_url:
+                file_id = upload_data.get("data", {}).get("file_id") or upload_data.get("id", "")
+                file_url = f"dashscope://file-{file_id}" if file_id else ""
+            if not file_url:
+                raise RuntimeError(f"音频上传失败: {upload_data}")
+            log.info("音频已上传: %s", file_url[:80])
+
+        # Step 2: 提交转写任务
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "X-DashScope-Async": "enable",
+                },
+                json={
+                    "model": "paraformer-v2",
+                    "input": {"file_urls": [file_url]},
+                    "parameters": {
+                        "language_hints": ["zh", "en"],
+                    },
+                },
             )
             resp.raise_for_status()
-            result = resp.json()
-            status = result.get("output", {}).get("task_status", "")
-            if status == "SUCCEEDED":
-                break
-            elif status == "FAILED":
-                raise RuntimeError(f"ASR 失败: {result}")
-            log.info("ASR 进行中... (%s)", status)
-        else:
-            raise TimeoutError("ASR 超时")
+            task_data = resp.json()
+            task_id = task_data.get("output", {}).get("task_id", "")
+            if not task_id:
+                raise RuntimeError(f"ASR 提交失败: {task_data}")
+            log.info("ASR 任务已提交: %s", task_id)
 
-    # Step 3: 解析结果
-    transcription = result.get("output", {}).get("results", [])
-    segments = []
-    full_text_parts = []
-    for item in transcription:
-        url = item.get("transcription_url", "")
-        if url:
-            async with httpx.AsyncClient(timeout=30) as client:
-                tr_resp = await client.get(url)
-                tr_data = tr_resp.json()
-                for trans in tr_data.get("transcripts", []):
-                    text = trans.get("text", "")
-                    full_text_parts.append(text)
-                    for sent in trans.get("sentences", []):
-                        segments.append({
-                            "start": sent.get("begin_time", 0) / 1000.0,
-                            "end": sent.get("end_time", 0) / 1000.0,
-                            "text": sent.get("text", ""),
-                        })
+        # Step 3: 轮询结果
+        async with httpx.AsyncClient(timeout=30) as client:
+            for _ in range(120):  # 最多等 10 分钟
+                await asyncio.sleep(5)
+                resp = await client.get(
+                    f"https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                status = result.get("output", {}).get("task_status", "")
+                if status == "SUCCEEDED":
+                    break
+                elif status == "FAILED":
+                    raise RuntimeError(f"ASR 失败: {result}")
+                log.info("ASR 进行中... (%s)", status)
+            else:
+                raise TimeoutError("ASR 超时")
 
-    full_text = "\n".join(full_text_parts)
-    log.info("ASR 完成: %d 段, %d 字", len(segments), len(full_text))
-    return {"text": full_text, "segments": segments}
+        # Step 4: 解析结果
+        transcription = result.get("output", {}).get("results", [])
+        segments = []
+        full_text_parts = []
+        for item in transcription:
+            url = item.get("transcription_url", "")
+            if url:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    tr_resp = await client.get(url)
+                    tr_data = tr_resp.json()
+                    for trans in tr_data.get("transcripts", []):
+                        text = trans.get("text", "")
+                        full_text_parts.append(text)
+                        for sent in trans.get("sentences", []):
+                            segments.append({
+                                "start": sent.get("begin_time", 0) / 1000.0,
+                                "end": sent.get("end_time", 0) / 1000.0,
+                                "text": sent.get("text", ""),
+                            })
+
+        full_text = "\n".join(full_text_parts)
+        log.info("ASR 完成: %d 段, %d 字", len(segments), len(full_text))
+        return {"text": full_text, "segments": segments}
+
+    finally:
+        # 清理临时 MP3
+        if tmp_mp3 and os.path.exists(tmp_mp3):
+            os.remove(tmp_mp3)
+            log.info("已清理临时 MP3: %s", tmp_mp3)
 
 
 # ── Visual Analysis: Qwen-VL ─────────────────────
@@ -230,45 +259,49 @@ async def extract_knowledge(
     for seg in transcript.get("segments", [])[:300]:
         transcript_lines.append(f"[{seg['start']:.1f}s-{seg['end']:.1f}s] {seg['text']}")
 
-    prompt = f"""你是一位资深技术讲师和知识整理专家。你的任务是将一段技术分享/课程录播的内容，整理成一份**可以直接用来学习的详细笔记**。
+    has_transcript = len(transcript_lines) > 0
+    has_visual = len(visual_summary) > 0
+
+    prompt = f"""你是一位资深知识整理专家。你的任务是根据下面提供的**实际素材**，整理成一份可以直接用来学习的详细笔记。
+
+## 重要约束（必须遵守）
+1. **只能使用下面提供的素材内容**，严禁添加素材中没有的信息
+2. **时间戳必须来自素材中的实际时间**，不要均匀切分或猜测
+3. 如果音频转写为空，就只根据画面分析来整理，并在摘要中说明"本报告基于画面分析，缺少语音内容"
+4. 如果某个知识点的时间范围不确定，用最近的关键帧时间戳
+5. 宁可少写也不要编造内容
 
 ## 视频名称
 {video_name}
 
 ## 音频转写（带时间戳）
-{chr(10).join(transcript_lines[:250])}
+{"（无音频转写数据）" if not has_transcript else chr(10).join(transcript_lines[:250])}
 {"... (更多内容省略)" if len(transcript_lines) > 250 else ""}
 
 ## 画面分析（关键帧截图内容）
-{chr(10).join(visual_summary)}
+{"（无画面分析数据）" if not has_visual else chr(10).join(visual_summary)}
 
 ## 输出要求
 
-你需要输出一份**教学级别的详细知识笔记**，不是简单的摘要。具体要求：
+输出一份**教学级别的详细知识笔记**。具体要求：
 
 ### 1. 每个知识点必须包含：
 - **title**: 知识点标题
-- **content**: 详细的教学内容（至少 200-500 字），要求：
-  - 像教科书一样解释概念的定义、原理、用途
-  - 如果涉及代码/命令，给出完整的代码示例和解释
-  - 如果涉及步骤/流程，列出详细的操作步骤
-  - 如果涉及对比，用表格或列表说明区别
-  - 包含讲师提到的注意事项、最佳实践、常见坑
-- **time_start_sec**: 该知识点在视频中的起始秒数（数字）
-- **time_end_sec**: 该知识点在视频中的结束秒数（数字）
+- **content**: 详细的教学内容（200-500 字），要求：
+  - 基于素材中讲师实际说的话和展示的画面来组织
+  - 如果涉及代码/命令，给出素材中出现的代码示例
+  - 如果涉及步骤/流程，列出讲师实际演示的步骤
+  - 包含讲师提到的注意事项、最佳实践
+- **time_start_sec**: 该知识点在视频中的起始秒数（必须来自素材中的实际时间戳）
+- **time_end_sec**: 该知识点在视频中的结束秒数（必须来自素材中的实际时间戳）
 - **importance**: high/medium/low
-- **related_frame_indices**: 相关的关键帧索引号列表（如 [3, 5, 8]），对应画面分析中的帧号
+- **related_frame_indices**: 相关的关键帧索引号列表（如 [3, 5, 8]），必须是画面分析中实际存在的帧号
 - **key_takeaways**: 该知识点的 2-3 个核心要点（字符串列表）
 
 ### 2. 整体结构：
-- **summary**: 整体摘要（100-200字），说明这个视频讲了什么主题、适合什么水平的学习者
+- **summary**: 整体摘要（100-200字）
 - **outline**: 视频大纲，按时间顺序列出章节 [{{"title": "...", "time_start_sec": 0, "time_end_sec": 300}}]
 - **knowledge_points**: 所有知识点（按时间顺序）
-
-### 3. 内容深度：
-- 不要只写"讲师介绍了XXX"这种摘要，要把XXX的具体内容写出来
-- 如果讲师演示了代码，把代码和解释都写出来
-- 如果讲师画了图/展示了架构，用文字详细描述架构的每个部分
 
 请用以下 JSON 格式输出：
 ```json

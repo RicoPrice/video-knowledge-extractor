@@ -107,18 +107,26 @@ var rj = {{ task.report_json | tojson }};
 var manifest = {{ task.manifest_json | tojson }};
 var hasVideo = !!document.getElementById('vid');
 
-// Step 1: Parse markdown normally (let marked handle everything except images)
-marked.setOptions({ breaks: true });
-var rawMd = md || '*报告尚未生成*';
-var html = marked.parse(rawMd);
-
-// Step 2: Fix images — marked v12+ may output <img> or may leave ![alt](url) as text
-// Replace any remaining ![alt](url) patterns in the rendered HTML
-html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function(match, alt, src) {
-  return '<img src="' + src + '" alt="' + alt + '" title="' + alt + '" loading="lazy" class="report-img">';
+// Step 1: Extract images from markdown BEFORE marked parses it
+// Use HTML comment placeholders that marked will pass through untouched
+var imageMap = {};
+var imgCounter = 0;
+var rawMd = (md || '*报告尚未生成*').replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function(match, alt, src) {
+  var key = '<!--IMG' + (imgCounter++) + '-->';
+  imageMap[key] = '<img src="' + src + '" alt="' + alt + '" title="' + alt + '" loading="lazy">';
+  return key;
 });
 
-// Step 3: Make timestamps clickable
+// Step 2: Parse markdown (images are now HTML comments, marked passes them through)
+marked.setOptions({ breaks: true });
+var html = marked.parse(rawMd);
+
+// Step 3: Replace HTML comment placeholders with actual <img> tags
+for (var key in imageMap) {
+  html = html.split(key).join(imageMap[key]);
+}
+
+// Step 4: Make timestamps clickable
 if (hasVideo) {
   html = html.replace(/(\d{1,2}:\d{2}(?::\d{2})?)\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?)/g, function(match, start, end) {
     var ss = tsToSec(start), es = tsToSec(end);
