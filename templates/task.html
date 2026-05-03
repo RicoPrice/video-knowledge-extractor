@@ -64,6 +64,20 @@
   }
   .pip-bar button:hover { background: rgba(255,255,255,0.3); }
   .pip-active { min-height: 180px; background: #111; border-radius: 0.5rem; }
+
+  /* 打印/导出 PDF 样式 */
+  @media print {
+    body { background: #fff; }
+    nav, #video-player, .pip-container, #lightbox, .tab-active,
+    button, a[href*="download"], .no-print { display: none !important; }
+    #tab-content-preview { display: block !important; }
+    #tab-content-raw, #tab-content-json, #tab-content-manifest { display: none !important; }
+    .prose { max-width: 100%; padding: 0; }
+    .prose img { max-width: 100%; page-break-inside: avoid; border-radius: 4px; }
+    .prose h2, .prose h3 { page-break-after: avoid; }
+    .prose table { font-size: 0.8rem; }
+    @page { margin: 1.5cm; size: A4; }
+  }
 </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -113,6 +127,7 @@
       {% if task.raw_srt %}
       <a href="/api/tasks/{{ task.id }}/download/raw_srt" class="px-3 py-1.5 bg-gray-100 text-gray-700 text-xs rounded-lg hover:bg-gray-200">下载 SRT（原始字幕）</a>
       {% endif %}
+      <button onclick="printReport()" class="px-3 py-1.5 bg-indigo-100 text-indigo-700 text-xs rounded-lg hover:bg-indigo-200">导出 PDF</button>
     </div>
   </div>
 
@@ -192,6 +207,12 @@ function tsToSec(ts) {
   if (parts.length === 3) return parts[0]*3600 + parts[1]*60 + parts[2];
   if (parts.length === 2) return parts[0]*60 + parts[1];
   return 0;
+}
+
+function printReport() {
+  // 确保预览 tab 可见
+  showTab('preview');
+  setTimeout(function() { window.print(); }, 300);
 }
 
 function seekTo(sec) {
