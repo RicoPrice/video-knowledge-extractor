@@ -88,10 +88,11 @@ uvicorn app:app --host 0.0.0.0 --port 7860
 
 1. **上传** — 拖拽视频到 Web 页面，SHA-256 去重检测
 2. **预处理** — FFmpeg 提取音频 → PySceneDetect 场景检测 → pHash 去重 → PPT 帧过滤
-3. **ASR 转写** — DashScope Paraformer-v2 语音转文字（带时间戳）
-4. **视觉分析** — Qwen-VL-Max 分析关键帧（均匀采样 30 张，5 路并发）
-5. **知识点提取** — DeepSeek 融合音频+视觉信息，输出结构化知识点
-6. **报告生成** — Markdown（带截图）/ JSON / SRT 多格式输出
+3. **ASR 转写** — 音频上传至 OSS → DashScope Paraformer-v2 语音转文字（带时间戳）
+4. **视觉分析** — Qwen-VL-Max 两轮采样：60 张快速分类 → 按优先级选 30 张详细分析（chart > ppt > code > other，过滤 camera/transition）
+5. **知识点提取** — DeepSeek 分块摘要（15 分钟/块，3 路并发）→ 分组合并同主题 → 生成大纲
+6. **知识点配图** — 从原视频按知识点时间段截帧 → Qwen-VL 分类过滤 camera/OBS 过渡帧 → 只保留有信息量的截图
+7. **报告生成** — Markdown（带截图 + 目录大纲）/ JSON / SRT 多格式输出
 
 ## 技术栈
 
