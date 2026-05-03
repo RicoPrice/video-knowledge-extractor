@@ -108,7 +108,10 @@
       <a href="/api/tasks/{{ task.id }}/download/json" class="px-3 py-1.5 bg-gray-100 text-gray-700 text-xs rounded-lg hover:bg-gray-200">下载 JSON</a>
       {% endif %}
       {% if task.report_srt %}
-      <a href="/api/tasks/{{ task.id }}/download/srt" class="px-3 py-1.5 bg-gray-100 text-gray-700 text-xs rounded-lg hover:bg-gray-200">下载 SRT</a>
+      <a href="/api/tasks/{{ task.id }}/download/srt" class="px-3 py-1.5 bg-gray-100 text-gray-700 text-xs rounded-lg hover:bg-gray-200">下载 SRT（总结）</a>
+      {% endif %}
+      {% if task.raw_srt %}
+      <a href="/api/tasks/{{ task.id }}/download/raw_srt" class="px-3 py-1.5 bg-gray-100 text-gray-700 text-xs rounded-lg hover:bg-gray-200">下载 SRT（原始字幕）</a>
       {% endif %}
     </div>
   </div>

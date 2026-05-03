@@ -952,6 +952,23 @@ def generate_json_report(video_name: str, knowledge: dict) -> str:
     return json.dumps({"video_name": video_name, **knowledge}, ensure_ascii=False, indent=2)
 
 
+def generate_raw_srt(transcript: dict) -> str:
+    """把 ASR 原始 segments 转成 SRT 格式字幕文件。"""
+    segments = transcript.get("segments", [])
+    lines = []
+    for i, seg in enumerate(segments, 1):
+        start = _sec_to_srt_ts(seg.get("start", 0))
+        end = _sec_to_srt_ts(seg.get("end", 0))
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        lines.append(str(i))
+        lines.append(f"{start} --> {end}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines)
+
+
 def generate_srt(knowledge: dict) -> str:
     lines = []
     for i, kp in enumerate(knowledge.get("knowledge_points", []), 1):
@@ -1213,5 +1230,6 @@ async def run_ai_pipeline(manifest_path: str, progress_cb=None) -> dict:
     md = error_block + generate_markdown(video_name, knowledge, visual_results, keyframes)
     rj = generate_json_report(video_name, {**knowledge, "errors": errors})
     srt = generate_srt(knowledge)
+    raw = generate_raw_srt(transcript)
 
-    return {"markdown": md, "json": rj, "srt": srt}
+    return {"markdown": md, "json": rj, "srt": srt, "raw_srt": raw}

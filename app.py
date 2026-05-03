@@ -168,13 +168,15 @@ async def api_download(task_id: str, fmt: str):
     task = await db.get_task(task_id)
     if not task:
         return JSONResponse({"error": "not found"}, 404)
-    field_map = {"md": "report_markdown", "json": "report_json", "srt": "report_srt", "html": "report_html"}
+    field_map = {"md": "report_markdown", "json": "report_json", "srt": "report_srt", "html": "report_html", "raw_srt": "raw_srt"}
     field = field_map.get(fmt)
     if not field or not task.get(field):
         return JSONResponse({"error": "report not available"}, 404)
-    ext_map = {"md": ".md", "json": ".json", "srt": ".srt", "html": ".html"}
+    ext_map = {"md": ".md", "json": ".json", "srt": ".srt", "html": ".html", "raw_srt": ".srt"}
     content = task[field]
-    filename = f"{task['video_name']}_report{ext_map[fmt]}"
+    name_map = {"raw_srt": "_原始字幕"}
+    suffix = name_map.get(fmt, "_report")
+    filename = f"{task['video_name']}{suffix}{ext_map[fmt]}"
     tmp_path = OUTPUT_DIR / filename
     with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -255,6 +257,7 @@ async def run_pipeline(task_id: str, video_path: str):
             report_markdown=result.get("markdown", ""),
             report_json=result.get("json", ""),
             report_srt=result.get("srt", ""),
+            raw_srt=result.get("raw_srt", ""),
             report_html="",
         )
     except asyncio.CancelledError:

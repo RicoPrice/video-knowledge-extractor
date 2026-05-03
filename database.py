@@ -27,9 +27,15 @@ async def init_db():
                 report_json TEXT,
                 report_srt TEXT,
                 report_html TEXT,
+                raw_srt TEXT,
                 error TEXT
             )
         """)
+        # 兼容旧表：如果 raw_srt 列不存在则添加
+        try:
+            await db.execute("ALTER TABLE tasks ADD COLUMN raw_srt TEXT")
+        except Exception:
+            pass  # 列已存在
         await db.commit()
 
 
