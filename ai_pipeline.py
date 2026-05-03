@@ -27,6 +27,79 @@ def _load_config() -> dict:
 
 # ── ASR: DashScope Paraformer ─────────────────────
 
+HOTWORDS_PATH = os.path.join(os.path.dirname(__file__), "hotwords.yaml")
+
+
+def _load_hotwords_config() -> dict:
+    """加载 hotwords.yaml，不存在则返回空 dict。"""
+    if os.path.exists(HOTWORDS_PATH):
+        with open(HOTWORDS_PATH, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def _save_vocabulary_id(vocab_id: str):
+    """把 vocabulary_id 写回 hotwords.yaml。"""
+    cfg = _load_hotwords_config()
+    cfg["vocabulary_id"] = vocab_id
+    with open(HOTWORDS_PATH, "w", encoding="utf-8") as f:
+        yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+
+
+async def _ensure_vocabulary(api_key: str) -> str:
+    """
+    确保热词表存在，返回 vocabulary_id。
+    - 如果 hotwords.yaml 不存在或 hotwords 为空 → 返回 ""
+    - 如果 vocabulary_id 已缓存 → 直接返回
+    - 否则调 DashScope API 创建热词表 → 缓存并返回
+    """
+    hw_cfg = _load_hotwords_config()
+    hotwords = hw_cfg.get("hotwords", {})
+    if not hotwords:
+        return ""
+
+    vocab_id = hw_cfg.get("vocabulary_id", "")
+    if vocab_id:
+        log.info("使用已缓存的热词表: %s", vocab_id)
+        return vocab_id
+
+    # 创建热词表
+    log.info("创建热词表: %d 个热词", len(hotwords))
+    vocabulary = []
+    for word, weight in hotwords.items():
+        lang = "zh" if any('\u4e00' <= c <= '\u9fff' for c in str(word)) else "en"
+        vocabulary.append({"text": str(word), "weight": int(weight), "lang": lang})
+
+    import httpx
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            "https://dashscope.aliyuncs.com/api/v1/services/audio/asr/customization",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "speech-biasing",
+                "input": {
+                    "action": "create_vocabulary",
+                    "target_model": "paraformer-v2",
+                    "prefix": "vke",
+                    "vocabulary": vocabulary,
+                },
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    vocab_id = data.get("output", {}).get("vocabulary_id", "")
+    if not vocab_id:
+        log.warning("热词表创建失败: %s", data)
+        return ""
+
+    log.info("热词表创建成功: %s", vocab_id)
+    _save_vocabulary_id(vocab_id)
+    return vocab_id
+
 async def transcribe_audio(audio_path: str, api_key: str) -> dict:
     """
     调用阿里云百炼 Paraformer-v2 进行语音转写。
@@ -88,12 +161,23 @@ async def transcribe_audio(audio_path: str, api_key: str) -> dict:
         signed_url = bucket.sign_url('GET', oss_key, 3600)
         log.info("OSS 签名 URL: %s", signed_url[:80])
 
-        # Step 2: 提交异步转写任务
-        task_response = await asyncio.to_thread(
-            Transcription.async_call,
+        # Step 2: 获取热词表（如果配置了）
+        vocab_id = await _ensure_vocabulary(api_key)
+        if vocab_id:
+            log.info("使用热词表: %s", vocab_id)
+
+        # Step 3: 提交异步转写任务
+        asr_kwargs = dict(
             model="paraformer-v2",
             file_urls=[signed_url],
             language_hints=["zh", "en"],
+        )
+        if vocab_id:
+            asr_kwargs["vocabulary_id"] = vocab_id
+
+        task_response = await asyncio.to_thread(
+            Transcription.async_call,
+            **asr_kwargs,
         )
 
         task_id = ""
