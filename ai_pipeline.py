@@ -156,17 +156,13 @@ async def transcribe_audio(audio_path: str, api_key: str) -> dict:
 async def analyze_keyframes(keyframes: list[dict], api_key: str) -> list[dict]:
     """
     调用 Qwen-VL-Max 分析关键帧图片。
-    两轮采样策略：
-      1. pHash 去重 → 均匀采样 60 张 → 快速分类（只问 visual_type）
-      2. 按优先级选 30 张有信息量的帧 → 详细分析
-    优先级：chart > ppt > code > other > camera
+    先用 pHash 去重，再均匀采样最多 MAX_FRAMES 张，5 路并发。
     """
-    CLASSIFY_FRAMES = 60   # 第一轮快速分类的帧数
-    DETAIL_FRAMES = 30     # 第二轮详细分析的帧数
+    MAX_FRAMES = 30
     CONCURRENCY = 5
-    PHASH_THRESHOLD = 8
+    PHASH_THRESHOLD = 8  # pHash 汉明距离阈值，越小越严格
 
-    # ── Step 1: pHash 去重 ──
+    # Step 1: pHash 去重 — 过滤掉相似帧
     try:
         import imagehash
         from PIL import Image
@@ -187,126 +183,32 @@ async def analyze_keyframes(keyframes: list[dict], api_key: str) -> list[dict]:
                     deduped.append(kf)
                     seen_hashes.append(h)
             except Exception:
-                deduped.append(kf)
+                deduped.append(kf)  # 无法计算 hash 的帧保留
         log.info("pHash 去重: %d → %d 张", len(keyframes), len(deduped))
     except ImportError:
         log.warning("imagehash 未安装，跳过 pHash 去重")
         deduped = [kf for kf in keyframes if kf.get("filepath") and os.path.exists(kf.get("filepath", ""))]
 
-    # ── Step 2: 均匀采样候选帧 ──
-    if len(deduped) > CLASSIFY_FRAMES:
-        step = len(deduped) / CLASSIFY_FRAMES
-        candidates = [deduped[int(i * step)] for i in range(CLASSIFY_FRAMES)]
+    # Step 2: 均匀采样
+    if len(deduped) > MAX_FRAMES:
+        step = len(deduped) / MAX_FRAMES
+        sampled = [deduped[int(i * step)] for i in range(MAX_FRAMES)]
+        log.info("视觉分析: 从 %d 张中采样 %d 张", len(deduped), len(sampled))
     else:
-        candidates = deduped
-    log.info("第一轮候选: %d 张", len(candidates))
+        sampled = deduped
+        log.info("视觉分析: %d 张关键帧", len(sampled))
 
-    # ── Step 3: 快速分类（只问 visual_type，省 token）──
     sem = asyncio.Semaphore(CONCURRENCY)
+    results = []
 
-    async def classify_one(kf: dict) -> dict | None:
-        filepath = kf.get("filepath", "")
-        if not filepath or not os.path.exists(filepath):
-            return None
-        with open(filepath, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode()
-        async with sem:
-            async with httpx.AsyncClient(timeout=60) as client:
-                try:
-                    resp = await client.post(
-                        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {api_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "model": "qwen-vl-max",
-                            "messages": [{
-                                "role": "user",
-                                "content": [
-                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                                    {"type": "text", "text": (
-                                        "这张图片属于哪种类型？只回答一个词：\n"
-                                        "ppt / chart / code / camera / other\n"
-                                        "（ppt=幻灯片/演示文稿, chart=图表/K线图/数据图, "
-                                        "code=代码/终端, camera=人物出镜/摄像头, other=其他）"
-                                    )},
-                                ],
-                            }],
-                            "max_tokens": 20,
-                        },
-                    )
-                    resp.raise_for_status()
-                    vtype = resp.json()["choices"][0]["message"]["content"].strip().lower()
-                    # 规范化
-                    for valid in ("ppt", "chart", "code", "camera"):
-                        if valid in vtype:
-                            vtype = valid
-                            break
-                    else:
-                        vtype = "other"
-                except Exception as e:
-                    log.warning("  帧 %d 分类失败: %s", kf.get("index", 0), e)
-                    vtype = "other"
-        return {**kf, "_visual_type": vtype}
-
-    classify_tasks = [classify_one(kf) for kf in candidates]
-    classified = [r for r in await asyncio.gather(*classify_tasks) if r is not None]
-    log.info("快速分类完成: %d 张 (%s)",
-             len(classified),
-             ", ".join(f"{t}={sum(1 for c in classified if c['_visual_type']==t)}"
-                       for t in ("chart", "ppt", "code", "camera", "other")))
-
-    # ── Step 4: 按优先级选帧，保证时间分布均匀 ──
-    PRIORITY = {"chart": 0, "ppt": 1, "code": 2, "other": 3, "camera": 4}
-
-    # 按时间排序
-    classified.sort(key=lambda x: x.get("timestamp", 0))
-
-    # 分成时间桶（每 10 分钟一桶），每桶内按优先级排序
-    bucket_seconds = 600
-    buckets: dict[int, list] = {}
-    for c in classified:
-        bucket_id = int(c.get("timestamp", 0) // bucket_seconds)
-        buckets.setdefault(bucket_id, []).append(c)
-
-    selected = []
-    # 每桶按优先级选，camera 排最后
-    for bid in sorted(buckets.keys()):
-        bucket = sorted(buckets[bid], key=lambda x: PRIORITY.get(x["_visual_type"], 3))
-        # 每桶最多选 ceil(DETAIL_FRAMES / len(buckets)) 张
-        per_bucket = max(1, -(-DETAIL_FRAMES // max(len(buckets), 1)))
-        selected.extend(bucket[:per_bucket])
-
-    # 如果选多了，按优先级裁剪；如果选少了，从剩余帧补充
-    if len(selected) > DETAIL_FRAMES:
-        selected.sort(key=lambda x: (PRIORITY.get(x["_visual_type"], 3), x.get("timestamp", 0)))
-        selected = selected[:DETAIL_FRAMES]
-    elif len(selected) < DETAIL_FRAMES:
-        selected_set = {c.get("index") for c in selected}
-        remaining = [c for c in classified if c.get("index") not in selected_set]
-        remaining.sort(key=lambda x: PRIORITY.get(x["_visual_type"], 3))
-        for r in remaining:
-            if len(selected) >= DETAIL_FRAMES:
-                break
-            selected.append(r)
-
-    # 按时间排序
-    selected.sort(key=lambda x: x.get("timestamp", 0))
-    type_counts = {}
-    for s in selected:
-        t = s["_visual_type"]
-        type_counts[t] = type_counts.get(t, 0) + 1
-    log.info("第二轮选帧: %d 张 (%s)", len(selected),
-             ", ".join(f"{t}={c}" for t, c in sorted(type_counts.items())))
-
-    # ── Step 5: 对选中的帧做详细分析 ──
     async def analyze_one(kf: dict) -> dict | None:
         filepath = kf.get("filepath", "")
         if not filepath or not os.path.exists(filepath):
             return None
+
         with open(filepath, "rb") as f:
             img_b64 = base64.b64encode(f.read()).decode()
+
         async with sem:
             async with httpx.AsyncClient(timeout=60) as client:
                 try:
@@ -339,16 +241,17 @@ async def analyze_keyframes(keyframes: list[dict], api_key: str) -> list[dict]:
                 except Exception as e:
                     log.warning("  帧 %d 分析失败: %s", kf.get("index", 0), e)
                     return None
+
         try:
             parsed = json.loads(answer.strip().strip("```json").strip("```").strip())
         except json.JSONDecodeError:
-            parsed = {"is_ppt": False, "visual_type": kf.get("_visual_type", "other"),
-                       "text_content": "", "description": answer[:200]}
+            parsed = {"is_ppt": False, "visual_type": "other", "text_content": "", "description": answer[:200]}
+
         log.info("  帧 %d (%.1fs): %s", kf.get("index", 0), kf.get("timestamp", 0), parsed.get("visual_type", "?"))
         return {"index": kf.get("index", 0), "timestamp": kf.get("timestamp", 0), **parsed}
 
-    detail_tasks = [analyze_one(kf) for kf in selected]
-    raw = await asyncio.gather(*detail_tasks)
+    tasks = [analyze_one(kf) for kf in sampled]
+    raw = await asyncio.gather(*tasks)
     results = [r for r in raw if r is not None]
 
     log.info("视觉分析完成: %d 张", len(results))
@@ -482,11 +385,7 @@ async def _chunked_summarize(
 ## 重要约束
 1. 只能使用下面提供的素材，严禁添加素材中没有的信息
 2. 时间戳必须来自素材中的实际时间
-3. 如果这段时间是闲聊/寒暄/无实质内容，直接返回空列表。以下都算闲聊：
-   - 主播打招呼、问候观众、等人进直播间
-   - 聊天气、吃饭、日常琐事
-   - 纯粹的弹幕互动（"谢谢关注"、"欢迎新朋友"）
-   - 没有传递可学习的知识或技能
+3. 如果这段时间是闲聊/寒暄/无实质内容，直接返回空列表
 4. 宁可少写也不要编造
 
 ## 视频名称
@@ -556,7 +455,7 @@ async def _final_synthesis(
     chunk_summaries: list[dict], visual_summary: list[str],
     video_name: str, dk_key: str, dk_url: str,
 ) -> dict:
-    """把分块摘要汇总成最终报告。分组合并避免 JSON 截断。"""
+    """把分块摘要汇总成最终报告。"""
     # 构建分块摘要文本
     summary_lines = []
     all_points = []
@@ -569,51 +468,19 @@ async def _final_synthesis(
 
     log.info("汇总: %d 块摘要, %d 个知识点", len(chunk_summaries), len(all_points))
 
-    if len(all_points) <= 25:
-        # 知识点不多，直接一轮合并
-        result = await _merge_points(all_points, summary_lines, video_name, dk_key, dk_url)
-    else:
-        # 知识点太多，先按时间段分组合并，再做最终汇总
-        GROUP_SIZE = 20
-        groups = []
-        for i in range(0, len(all_points), GROUP_SIZE):
-            groups.append(all_points[i:i + GROUP_SIZE])
+    # 无论知识点多少，都做一轮合并 — 跨块的同主题知识点需要合并
+    points_text = json.dumps(all_points, ensure_ascii=False)
+    # 如果太长，截断（DeepSeek 上下文有限）
+    if len(points_text) > 50000:
+        points_text = points_text[:50000] + "...(已截断)"
 
-        log.info("分组合并: %d 个知识点 → %d 组", len(all_points), len(groups))
-
-        merged_points = []
-        for gi, group in enumerate(groups):
-            merged = await _merge_points(group, summary_lines, video_name, dk_key, dk_url)
-            merged_pts = merged.get("knowledge_points", group)
-            merged_points.extend(merged_pts)
-            log.info("  组 %d/%d: %d → %d 个知识点", gi + 1, len(groups),
-                     len(group), len(merged_pts))
-
-        # 最终汇总：生成摘要和大纲（用合并后的知识点）
-        result = await _merge_points(merged_points, summary_lines, video_name, dk_key, dk_url)
-
-    # 确保字段完整
-    if not result.get("knowledge_points"):
-        result["knowledge_points"] = all_points
-
-    log.info("合并后: %d → %d 个知识点", len(all_points), len(result["knowledge_points"]))
-    return result
-
-
-async def _merge_points(
-    points: list[dict], summary_lines: list[str],
-    video_name: str, dk_key: str, dk_url: str,
-) -> dict:
-    """合并一组知识点（同主题跨块合并），生成摘要和大纲。"""
-    points_text = json.dumps(points, ensure_ascii=False)
-
-    prompt = f"""以下是从视频 "{video_name}" 中提取的知识点（{len(points)} 个）。
+    prompt = f"""以下是从视频 "{video_name}" 中按时间分块提取的知识点。
 请完成两件事：
 
 ### 任务 1：合并知识点
-- 如果多个知识点讲的是同一个主题（比如连续几个都在讲 MACD），合并成一个完整的知识点
+- 如果多个块讲的是同一个主题（比如连续 3 个块都在讲 MACD），合并成一个完整的知识点
 - 合并时保留最详细的内容，时间范围取最早的 start 和最晚的 end
-- 如果某个知识点是独立的，保持原样
+- 如果某个知识点只出现在一个块里，保持原样
 - 不要添加素材中没有的信息
 
 ### 任务 2：生成摘要和大纲
@@ -667,8 +534,13 @@ async def _merge_points(
         result = json.loads(answer.strip().strip("```json").strip("```").strip())
     except json.JSONDecodeError:
         log.error("合并结果 JSON 解析失败，使用原始知识点")
-        result = {"summary": "", "outline": [], "knowledge_points": points}
+        result = {"summary": "", "outline": [], "knowledge_points": all_points}
 
+    # 确保字段完整
+    if not result.get("knowledge_points"):
+        result["knowledge_points"] = all_points
+
+    log.info("合并后: %d → %d 个知识点", len(all_points), len(result["knowledge_points"]))
     return result
 
 
@@ -831,57 +703,13 @@ def generate_markdown(video_name: str, knowledge: dict, visual_results: list[dic
 
         # 嵌入关联的关键帧截图
         related_frames = kp.get("related_frame_indices", [])
-        matched_frames = []
-
-        # 第一选择：DeepSeek 返回的 related_frame_indices
         if related_frames and keyframes:
-            for fi in related_frames[:3]:
-                # fi 可能是 int、str、或 dict（如 {"index": 3}）
-                if isinstance(fi, dict):
-                    fi = fi.get("index", fi.get("frame_index", -1))
-                try:
-                    fi = int(fi)
-                except (ValueError, TypeError):
-                    continue
+            for fi in related_frames[:3]:  # 最多 3 张
                 kf = frame_map.get(fi)
                 if kf and kf.get("filename"):
-                    matched_frames.append(kf)
-
-        # 回退：如果没有关联帧，从全部关键帧中按时间戳找最近的有信息量的帧
-        if not matched_frames and keyframes:
-            kp_mid = (kp.get("time_start_sec", 0) + kp.get("time_end_sec", 0)) / 2
-            kp_start = kp.get("time_start_sec", 0)
-            kp_end = kp.get("time_end_sec", 0)
-
-            # 从视觉分析结果中找该时间段内的非 camera 帧
-            vr_in_range = [
-                vr for vr in visual_results
-                if kp_start <= vr.get("timestamp", 0) <= kp_end
-                and vr.get("visual_type", "camera") != "camera"
-            ]
-            if vr_in_range:
-                # 按优先级排序
-                priority = {"chart": 0, "ppt": 1, "code": 2, "other": 3}
-                vr_in_range.sort(key=lambda x: priority.get(x.get("visual_type", "other"), 3))
-                for vr in vr_in_range[:2]:
-                    kf = frame_map.get(vr.get("index"))
-                    if kf and kf.get("filename"):
-                        matched_frames.append(kf)
-
-            # 如果视觉分析结果里也没有，从全部 688 帧中找时间最近的
-            if not matched_frames:
-                candidates = [
-                    kf for kf in keyframes
-                    if kf.get("filename") and kp_start - 30 <= kf.get("timestamp", 0) <= kp_end + 30
-                ]
-                if candidates:
-                    candidates.sort(key=lambda x: abs(x.get("timestamp", 0) - kp_mid))
-                    matched_frames.append(candidates[0])
-
-        for kf in matched_frames[:3]:
-            from urllib.parse import quote
-            img_path = f"/output/{quote(video_name)}/keyframes/{quote(kf['filename'])}"
-            lines.append(f"![帧{kf.get('index', 0)} ({_sec_to_ts(kf.get('timestamp', 0))})]({img_path})\n")
+                    from urllib.parse import quote
+                    img_path = f"/output/{quote(video_name)}/keyframes/{quote(kf['filename'])}"
+                    lines.append(f"![帧{fi} ({_sec_to_ts(kf.get('timestamp', 0))})]({img_path})\n")
 
         # 正文内容
         lines.append(f"{kp['content']}\n")
