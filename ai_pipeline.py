@@ -325,9 +325,16 @@ async def analyze_keyframes(keyframes: list[dict], api_key: str) -> list[dict]:
                                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
                                     {"type": "text", "text": (
                                         "分析这张视频截图，用 JSON 格式回答：\n"
-                                        '{"is_ppt": true/false, "visual_type": "ppt|code|chart|camera|other", '
+                                        '{"is_ppt": true/false, "visual_type": "ppt|code|chart|camera|transition|other", '
                                         '"text_content": "图片中的文字内容", '
                                         '"description": "一句话描述画面内容"}\n'
+                                        "visual_type 说明：\n"
+                                        "- ppt: 幻灯片/演示文稿\n"
+                                        "- chart: 图表/K线图/数据图/股票软件界面\n"
+                                        "- code: 代码/终端\n"
+                                        "- camera: 人物出镜/摄像头画面（无教学信息）\n"
+                                        "- transition: 直播软件界面(OBS等)/场景切换过渡/画面部分遮挡/软件UI\n"
+                                        "- other: 其他有信息量的画面\n"
                                         "只返回 JSON，不要其他内容。"
                                     )},
                                 ],
@@ -693,11 +700,13 @@ async def _generate_outline(
 
     prompt = f"""根据以下视频的分段摘要和知识点列表，生成：
 1. 一段 100-200 字的整体摘要
-2. 视频大纲（按时间顺序的章节列表，用于目录索引）
+2. 视频大纲（按内容主题划分的章节列表，用于目录索引）
 
 大纲要求：
+- 按**内容主题**划分章节，不要按固定时间间隔（如每15分钟）均分
 - 把相邻的、主题相近的知识点归入同一章节
-- 每个章节覆盖一段连续的时间范围
+- 一个章节可以跨越 5 分钟也可以跨越 40 分钟，取决于主题的实际时长
+- 时间范围必须来自知识点的实际时间戳，不要凑整数
 - 章节数量控制在 5-15 个
 
 ## 视频名称
@@ -893,6 +902,16 @@ def generate_markdown(video_name: str, knowledge: dict, visual_results: list[dic
 
     # 知识点
     lines.append("## 📚 知识点详解\n")
+
+    # 记录已使用的帧索引，避免同一帧反复出现
+    used_frame_indices = set()
+
+    # 建立帧索引 → visual_type 的映射（只需建一次）
+    vr_type_map = {}
+    for vr in visual_results:
+        vr_type_map[vr.get("index", -1)] = vr.get("visual_type", "other")
+    SKIP_TYPES = {"camera", "transition"}
+
     for i, kp in enumerate(knowledge.get("knowledge_points", []), 1):
         imp = {"high": "🔴 重要", "medium": "🟡 一般", "low": "🟢 了解"}.get(kp.get("importance", ""), "")
 
@@ -906,13 +925,7 @@ def generate_markdown(video_name: str, knowledge: dict, visual_results: list[dic
         related_frames = kp.get("related_frame_indices", [])
         matched_frames = []
 
-        # 建立帧索引 → visual_type 的映射（用于过滤无信息量帧）
-        vr_type_map = {}
-        for vr in visual_results:
-            vr_type_map[vr.get("index", -1)] = vr.get("visual_type", "other")
-        SKIP_TYPES = {"camera", "transition"}
-
-        # 第一选择：DeepSeek 返回的 related_frame_indices（过滤 camera/transition）
+        # 第一选择：DeepSeek 返回的 related_frame_indices（过滤 camera/transition + 已用帧）
         if related_frames and keyframes:
             for fi in related_frames[:3]:
                 if isinstance(fi, dict):
@@ -921,7 +934,8 @@ def generate_markdown(video_name: str, knowledge: dict, visual_results: list[dic
                     fi = int(fi)
                 except (ValueError, TypeError):
                     continue
-                # 跳过无信息量的帧
+                if fi in used_frame_indices:
+                    continue
                 if vr_type_map.get(fi, "other") in SKIP_TYPES:
                     continue
                 kf = frame_map.get(fi)
@@ -938,6 +952,7 @@ def generate_markdown(video_name: str, knowledge: dict, visual_results: list[dic
                 vr for vr in visual_results
                 if kp_start <= vr.get("timestamp", 0) <= kp_end
                 and vr.get("visual_type", "camera") not in SKIP_TYPES
+                and vr.get("index", -1) not in used_frame_indices
             ]
             if vr_in_range:
                 priority = {"chart": 0, "ppt": 1, "code": 2, "other": 3}
@@ -947,20 +962,23 @@ def generate_markdown(video_name: str, knowledge: dict, visual_results: list[dic
                     if kf and kf.get("filename"):
                         matched_frames.append(kf)
 
-            # 兜底：从全部帧中找时间最近的，但仍然跳过 camera/transition
+            # 兜底：从已分类的帧中找时间最近的有信息量帧（未用过的）
             if not matched_frames:
-                candidates = [
-                    kf for kf in keyframes
-                    if kf.get("filename")
-                    and kp_start - 30 <= kf.get("timestamp", 0) <= kp_end + 30
-                    and vr_type_map.get(kf.get("index", -1), "other") not in SKIP_TYPES
+                all_classified = [
+                    vr for vr in visual_results
+                    if vr.get("visual_type", "camera") not in SKIP_TYPES
+                    and vr.get("index", -1) not in used_frame_indices
                 ]
-                if candidates:
-                    candidates.sort(key=lambda x: abs(x.get("timestamp", 0) - kp_mid))
-                    matched_frames.append(candidates[0])
-                # 如果该时间段真的没有有信息量的帧，就不配图（不放 camera）
+                if all_classified:
+                    all_classified.sort(key=lambda x: abs(x.get("timestamp", 0) - kp_mid))
+                    best_vr = all_classified[0]
+                    kf = frame_map.get(best_vr.get("index"))
+                    if kf and kf.get("filename"):
+                        matched_frames.append(kf)
+                # 没有合适的帧就不配图
 
-        for kf in matched_frames[:3]:
+        for kf in matched_frames[:2]:
+            used_frame_indices.add(kf.get("index", -1))
             from urllib.parse import quote
             img_path = f"/output/{quote(video_name)}/keyframes/{quote(kf['filename'])}"
             lines.append(f"![帧{kf.get('index', 0)} ({_sec_to_ts(kf.get('timestamp', 0))})]({img_path})\n")
