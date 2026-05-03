@@ -231,8 +231,8 @@ async def analyze_keyframes(keyframes: list[dict], api_key: str) -> list[dict]:
                                         "（ppt=幻灯片/演示文稿, chart=图表/K线图/数据图, "
                                         "code=代码/终端, camera=人物出镜/摄像头, "
                                         "transition=软件切换画面/OBS过渡/部分遮挡, other=其他）\n"
-                                        "注意：如果画面出现大面积黑色区域、软件UI边框、桌面/任务栏、"
-                                        "或'画中画'（屏幕里套屏幕），即使部分区域有内容，也应归为 transition。"
+                                        "注意：transition 仅指能看到操作系统桌面/任务栏、OBS控制面板、"
+                                        "或同一画面递归缩小重复（套娃）的情况。股票软件的多面板界面属于 chart，不是 transition。"
                                     )},
                                 ],
                             }],
@@ -335,9 +335,10 @@ async def analyze_keyframes(keyframes: list[dict], api_key: str) -> list[dict]:
                                         "- chart: 图表/K线图/数据图/股票软件界面\n"
                                         "- code: 代码/终端\n"
                                         "- camera: 人物出镜/摄像头画面（无教学信息）\n"
-                                        "- transition: 直播软件界面(OBS等)/场景切换过渡/画面部分遮挡/软件UI/画中画(屏幕里套屏幕)\n"
+                                        "- transition: 直播软件界面(OBS等)/场景切换过渡/画面部分遮挡\n"
                                         "- other: 其他有信息量的画面\n"
-                                        "注意：如果画面出现大面积黑色区域、桌面/任务栏、或'画中画'（屏幕里套屏幕），即使部分区域有内容，也应归为 transition。\n"
+                                        "注意：transition 仅指能看到操作系统桌面/任务栏、OBS控制面板、"
+                                        "或同一画面递归缩小重复（套娃）的情况。股票软件的多面板界面属于 chart，不是 transition。\n"
                                         "只返回 JSON，不要其他内容。"
                                     )},
                                 ],
@@ -1009,9 +1010,8 @@ async def _extract_kp_screenshots(
                                         "ppt / chart / code / camera / transition / other\n"
                                         "（chart=图表/K线图/股票软件, ppt=幻灯片, code=代码, "
                                         "camera=人物出镜, transition=OBS/直播软件/场景切换/遮挡）\n"
-                                        "注意：如果画面出现'画中画套娃'（屏幕里套屏幕、能看到桌面或任务栏），"
-                                        "或有大面积黑色区域、软件UI边框、明显的场景切换痕迹，"
-                                        "即使部分区域有内容，也应归为 transition。"
+                                        "注意：transition 仅指能看到操作系统桌面/任务栏、OBS控制面板、"
+                                        "或同一画面递归缩小重复（套娃）的情况。股票软件的多面板界面属于 chart，不是 transition。"
                                     )},
                                 ],
                             }],
