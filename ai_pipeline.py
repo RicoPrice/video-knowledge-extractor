@@ -227,9 +227,10 @@ async def analyze_keyframes(keyframes: list[dict], api_key: str) -> list[dict]:
                                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
                                     {"type": "text", "text": (
                                         "这张图片属于哪种类型？只回答一个词：\n"
-                                        "ppt / chart / code / camera / other\n"
+                                        "ppt / chart / code / camera / transition / other\n"
                                         "（ppt=幻灯片/演示文稿, chart=图表/K线图/数据图, "
-                                        "code=代码/终端, camera=人物出镜/摄像头, other=其他）"
+                                        "code=代码/终端, camera=人物出镜/摄像头, "
+                                        "transition=软件切换画面/OBS过渡/部分遮挡, other=其他）"
                                     )},
                                 ],
                             }],
@@ -239,7 +240,7 @@ async def analyze_keyframes(keyframes: list[dict], api_key: str) -> list[dict]:
                     resp.raise_for_status()
                     vtype = resp.json()["choices"][0]["message"]["content"].strip().lower()
                     # 规范化
-                    for valid in ("ppt", "chart", "code", "camera"):
+                    for valid in ("ppt", "chart", "code", "camera", "transition"):
                         if valid in vtype:
                             vtype = valid
                             break
@@ -258,7 +259,7 @@ async def analyze_keyframes(keyframes: list[dict], api_key: str) -> list[dict]:
                        for t in ("chart", "ppt", "code", "camera", "other")))
 
     # ── Step 4: 按优先级选帧，保证时间分布均匀 ──
-    PRIORITY = {"chart": 0, "ppt": 1, "code": 2, "other": 3, "camera": 4}
+    PRIORITY = {"chart": 0, "ppt": 1, "code": 2, "other": 3, "camera": 99, "transition": 99}
 
     # 按时间排序
     classified.sort(key=lambda x: x.get("timestamp", 0))
@@ -573,7 +574,7 @@ async def _final_synthesis(
         # 知识点不多，直接一轮合并
         result = await _merge_points(all_points, summary_lines, video_name, dk_key, dk_url)
     else:
-        # 知识点太多，先按时间段分组合并，再做最终汇总
+        # 知识点太多，先按时间段分组合并
         GROUP_SIZE = 20
         groups = []
         for i in range(0, len(all_points), GROUP_SIZE):
@@ -589,8 +590,13 @@ async def _final_synthesis(
             log.info("  组 %d/%d: %d → %d 个知识点", gi + 1, len(groups),
                      len(group), len(merged_pts))
 
-        # 最终汇总：生成摘要和大纲（用合并后的知识点）
-        result = await _merge_points(merged_points, summary_lines, video_name, dk_key, dk_url)
+        # 单独生成 outline 和 summary（轻量请求，不传知识点全文）
+        meta = await _generate_outline(merged_points, summary_lines, video_name, dk_key, dk_url)
+        result = {
+            "summary": meta.get("summary", ""),
+            "outline": meta.get("outline", []),
+            "knowledge_points": merged_points,
+        }
 
     # 确保字段完整
     if not result.get("knowledge_points"):
@@ -669,6 +675,73 @@ async def _merge_points(
         log.error("合并结果 JSON 解析失败，使用原始知识点")
         result = {"summary": "", "outline": [], "knowledge_points": points}
 
+    return result
+
+
+async def _generate_outline(
+    points: list[dict], summary_lines: list[str],
+    video_name: str, dk_key: str, dk_url: str,
+) -> dict:
+    """单独生成 outline 和 summary（轻量请求，只传知识点标题和时间）。"""
+    # 只传标题和时间，不传完整 content，避免超长
+    point_briefs = []
+    for pt in points:
+        title = pt.get("title", "")
+        t0 = pt.get("time_start_sec", 0)
+        t1 = pt.get("time_end_sec", 0)
+        point_briefs.append(f"[{t0:.0f}s-{t1:.0f}s] {title}")
+
+    prompt = f"""根据以下视频的分段摘要和知识点列表，生成：
+1. 一段 100-200 字的整体摘要
+2. 视频大纲（按时间顺序的章节列表，用于目录索引）
+
+大纲要求：
+- 把相邻的、主题相近的知识点归入同一章节
+- 每个章节覆盖一段连续的时间范围
+- 章节数量控制在 5-15 个
+
+## 视频名称
+{video_name}
+
+## 分段摘要
+{chr(10).join(summary_lines)}
+
+## 知识点列表（{len(points)} 个）
+{chr(10).join(point_briefs)}
+
+用 JSON 格式输出：
+```json
+{{
+  "summary": "整体摘要...",
+  "outline": [{{"title": "章节名", "time_start_sec": 0, "time_end_sec": 300}}]
+}}
+```
+只返回 JSON。"""
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            f"{dk_url}/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {dk_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 4096,
+                "temperature": 0.3,
+            },
+        )
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        result = json.loads(answer.strip().strip("```json").strip("```").strip())
+    except json.JSONDecodeError:
+        log.error("大纲生成 JSON 解析失败")
+        result = {"summary": "", "outline": []}
+
+    log.info("大纲生成: %d 个章节", len(result.get("outline", [])))
     return result
 
 
@@ -833,34 +906,40 @@ def generate_markdown(video_name: str, knowledge: dict, visual_results: list[dic
         related_frames = kp.get("related_frame_indices", [])
         matched_frames = []
 
-        # 第一选择：DeepSeek 返回的 related_frame_indices
+        # 建立帧索引 → visual_type 的映射（用于过滤无信息量帧）
+        vr_type_map = {}
+        for vr in visual_results:
+            vr_type_map[vr.get("index", -1)] = vr.get("visual_type", "other")
+        SKIP_TYPES = {"camera", "transition"}
+
+        # 第一选择：DeepSeek 返回的 related_frame_indices（过滤 camera/transition）
         if related_frames and keyframes:
             for fi in related_frames[:3]:
-                # fi 可能是 int、str、或 dict（如 {"index": 3}）
                 if isinstance(fi, dict):
                     fi = fi.get("index", fi.get("frame_index", -1))
                 try:
                     fi = int(fi)
                 except (ValueError, TypeError):
                     continue
+                # 跳过无信息量的帧
+                if vr_type_map.get(fi, "other") in SKIP_TYPES:
+                    continue
                 kf = frame_map.get(fi)
                 if kf and kf.get("filename"):
                     matched_frames.append(kf)
 
-        # 回退：如果没有关联帧，从全部关键帧中按时间戳找最近的有信息量的帧
+        # 回退：从视觉分析结果中找该时间段内有信息量的帧
         if not matched_frames and keyframes:
             kp_mid = (kp.get("time_start_sec", 0) + kp.get("time_end_sec", 0)) / 2
             kp_start = kp.get("time_start_sec", 0)
             kp_end = kp.get("time_end_sec", 0)
 
-            # 从视觉分析结果中找该时间段内的非 camera 帧
             vr_in_range = [
                 vr for vr in visual_results
                 if kp_start <= vr.get("timestamp", 0) <= kp_end
-                and vr.get("visual_type", "camera") != "camera"
+                and vr.get("visual_type", "camera") not in SKIP_TYPES
             ]
             if vr_in_range:
-                # 按优先级排序
                 priority = {"chart": 0, "ppt": 1, "code": 2, "other": 3}
                 vr_in_range.sort(key=lambda x: priority.get(x.get("visual_type", "other"), 3))
                 for vr in vr_in_range[:2]:
@@ -868,15 +947,18 @@ def generate_markdown(video_name: str, knowledge: dict, visual_results: list[dic
                     if kf and kf.get("filename"):
                         matched_frames.append(kf)
 
-            # 如果视觉分析结果里也没有，从全部 688 帧中找时间最近的
+            # 兜底：从全部帧中找时间最近的，但仍然跳过 camera/transition
             if not matched_frames:
                 candidates = [
                     kf for kf in keyframes
-                    if kf.get("filename") and kp_start - 30 <= kf.get("timestamp", 0) <= kp_end + 30
+                    if kf.get("filename")
+                    and kp_start - 30 <= kf.get("timestamp", 0) <= kp_end + 30
+                    and vr_type_map.get(kf.get("index", -1), "other") not in SKIP_TYPES
                 ]
                 if candidates:
                     candidates.sort(key=lambda x: abs(x.get("timestamp", 0) - kp_mid))
                     matched_frames.append(candidates[0])
+                # 如果该时间段真的没有有信息量的帧，就不配图（不放 camera）
 
         for kf in matched_frames[:3]:
             from urllib.parse import quote
