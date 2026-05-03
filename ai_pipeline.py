@@ -230,7 +230,9 @@ async def analyze_keyframes(keyframes: list[dict], api_key: str) -> list[dict]:
                                         "ppt / chart / code / camera / transition / other\n"
                                         "（ppt=幻灯片/演示文稿, chart=图表/K线图/数据图, "
                                         "code=代码/终端, camera=人物出镜/摄像头, "
-                                        "transition=软件切换画面/OBS过渡/部分遮挡, other=其他）"
+                                        "transition=软件切换画面/OBS过渡/部分遮挡, other=其他）\n"
+                                        "注意：如果画面有大面积黑色区域、软件UI边框、或明显的场景切换痕迹，"
+                                        "即使部分区域有内容，也应归为 transition。"
                                     )},
                                 ],
                             }],
@@ -1005,7 +1007,9 @@ async def _extract_kp_screenshots(
                                         "这张图片属于哪种类型？只回答一个词：\n"
                                         "ppt / chart / code / camera / transition / other\n"
                                         "（chart=图表/K线图/股票软件, ppt=幻灯片, code=代码, "
-                                        "camera=人物出镜, transition=OBS/直播软件/场景切换/遮挡）"
+                                        "camera=人物出镜, transition=OBS/直播软件/场景切换/遮挡）\n"
+                                        "注意：如果画面有大面积黑色区域、软件UI边框、或明显的场景切换痕迹，"
+                                        "即使部分区域有内容，也应归为 transition。"
                                     )},
                                 ],
                             }],
