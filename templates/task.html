@@ -40,6 +40,30 @@
   #lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 50; cursor: pointer; align-items: center; justify-content: center; }
   #lightbox img { max-width: 90vw; max-height: 90vh; border-radius: 0.5rem; }
   #lightbox.active { display: flex; }
+
+  /* PiP 小窗 */
+  .pip-container {
+    position: fixed; bottom: 24px; right: 24px; width: 320px; z-index: 40;
+    border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+    opacity: 0; pointer-events: none; transition: opacity 0.3s ease;
+    background: #000;
+  }
+  .pip-container.visible { opacity: 1; pointer-events: auto; }
+  .pip-container.dragging { transition: none; }
+  .pip-container video { width: 100%; border-radius: 12px; display: block; }
+  .pip-bar {
+    position: absolute; top: 0; left: 0; right: 0; height: 32px;
+    display: flex; align-items: center; justify-content: flex-end; gap: 4px;
+    padding: 0 6px; cursor: grab; border-radius: 12px 12px 0 0;
+    background: linear-gradient(180deg, rgba(0,0,0,0.5) 0%, transparent 100%);
+  }
+  .pip-bar button {
+    width: 26px; height: 26px; border: none; border-radius: 6px; cursor: pointer;
+    color: #fff; font-size: 14px; background: rgba(255,255,255,0.15);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .pip-bar button:hover { background: rgba(255,255,255,0.3); }
+  .pip-active { min-height: 180px; background: #111; border-radius: 0.5rem; }
 </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -47,6 +71,14 @@
 <!-- Lightbox for image zoom -->
 <div id="lightbox" onclick="this.classList.remove('active')">
   <img id="lightbox-img" src="" alt="">
+</div>
+
+<!-- PiP 小窗 -->
+<div class="pip-container" id="pip">
+  <div class="pip-bar" id="pip-bar">
+    <button id="pip-back" title="回到原位">↩</button>
+    <button id="pip-close" title="关闭小窗">✕</button>
+  </div>
 </div>
 
 <nav class="bg-white border-b px-6 py-3 flex items-center gap-4">
@@ -161,8 +193,113 @@ function tsToSec(ts) {
 
 function seekTo(sec) {
   var vid = document.getElementById('vid');
-  if (vid) { vid.currentTime = sec; vid.play(); vid.scrollIntoView({behavior:'smooth', block:'start'}); }
+  if (vid) { vid.currentTime = sec; vid.play(); }
 }
+
+// ── PiP 小窗逻辑 ──
+(function() {
+  var vid = document.getElementById('vid');
+  if (!vid) return;
+
+  var player = document.getElementById('video-player');
+  var pip = document.getElementById('pip');
+  var pipBar = document.getElementById('pip-bar');
+  var pipClose = document.getElementById('pip-close');
+  var pipBack = document.getElementById('pip-back');
+  var dismissed = false;  // 用户手动关闭后不再自动弹出
+  var inPip = false;
+
+  // 占位符：视频移走后保持原位高度
+  var placeholder = document.createElement('div');
+  placeholder.className = 'pip-active';
+  placeholder.style.display = 'none';
+
+  function enterPip() {
+    if (inPip || dismissed) return;
+    inPip = true;
+    // 记住原始尺寸
+    placeholder.style.height = vid.offsetHeight + 'px';
+    player.insertBefore(placeholder, vid);
+    placeholder.style.display = 'block';
+    pip.appendChild(vid);
+    pip.classList.add('visible');
+  }
+
+  function exitPip() {
+    if (!inPip) return;
+    inPip = false;
+    pip.classList.remove('visible');
+    placeholder.parentNode.insertBefore(vid, placeholder);
+    placeholder.style.display = 'none';
+  }
+
+  // IntersectionObserver：视频播放器离开视口 → 进入小窗
+  var observer = new IntersectionObserver(function(entries) {
+    entries.forEach(function(entry) {
+      if (!entry.isIntersecting) {
+        enterPip();
+      } else {
+        exitPip();
+      }
+    });
+  }, { threshold: 0.3 });
+  observer.observe(player);
+
+  // 关闭按钮
+  pipClose.addEventListener('click', function() {
+    dismissed = true;
+    exitPip();
+  });
+
+  // 回到原位按钮
+  pipBack.addEventListener('click', function() {
+    exitPip();
+    player.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+
+  // 拖拽
+  var dragging = false, startX, startY, startLeft, startBottom;
+  pipBar.addEventListener('mousedown', function(e) {
+    if (e.target.tagName === 'BUTTON') return;
+    dragging = true;
+    pip.classList.add('dragging');
+    var rect = pip.getBoundingClientRect();
+    startX = e.clientX; startY = e.clientY;
+    startLeft = rect.left; startBottom = window.innerHeight - rect.bottom;
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', function(e) {
+    if (!dragging) return;
+    var dx = e.clientX - startX, dy = e.clientY - startY;
+    pip.style.left = (startLeft + dx) + 'px';
+    pip.style.bottom = (startBottom - dy) + 'px';
+    pip.style.right = 'auto';
+  });
+  document.addEventListener('mouseup', function() {
+    if (dragging) { dragging = false; pip.classList.remove('dragging'); }
+  });
+
+  // 触摸拖拽
+  pipBar.addEventListener('touchstart', function(e) {
+    if (e.target.tagName === 'BUTTON') return;
+    dragging = true;
+    pip.classList.add('dragging');
+    var rect = pip.getBoundingClientRect();
+    var t = e.touches[0];
+    startX = t.clientX; startY = t.clientY;
+    startLeft = rect.left; startBottom = window.innerHeight - rect.bottom;
+  }, { passive: true });
+  document.addEventListener('touchmove', function(e) {
+    if (!dragging) return;
+    var t = e.touches[0], dx = t.clientX - startX, dy = t.clientY - startY;
+    pip.style.left = (startLeft + dx) + 'px';
+    pip.style.bottom = (startBottom - dy) + 'px';
+    pip.style.right = 'auto';
+  }, { passive: true });
+  document.addEventListener('touchend', function() {
+    if (dragging) { dragging = false; pip.classList.remove('dragging'); }
+  });
+})();
 
 function showTab(name) {
   ['preview','raw','json','manifest'].forEach(function(t) {
