@@ -921,67 +921,12 @@ def generate_markdown(video_name: str, knowledge: dict, visual_results: list[dic
         lines.append(f"### {i}. {kp['title']}\n")
         lines.append(f"⏱️ **{ts_start} - {ts_end}** &nbsp; {imp}\n")
 
-        # 嵌入关联的关键帧截图
-        related_frames = kp.get("related_frame_indices", [])
-        matched_frames = []
-
-        # 第一选择：DeepSeek 返回的 related_frame_indices（过滤 camera/transition + 已用帧）
-        if related_frames and keyframes:
-            for fi in related_frames[:3]:
-                if isinstance(fi, dict):
-                    fi = fi.get("index", fi.get("frame_index", -1))
-                try:
-                    fi = int(fi)
-                except (ValueError, TypeError):
-                    continue
-                if fi in used_frame_indices:
-                    continue
-                if vr_type_map.get(fi, "other") in SKIP_TYPES:
-                    continue
-                kf = frame_map.get(fi)
-                if kf and kf.get("filename"):
-                    matched_frames.append(kf)
-
-        # 回退：从视觉分析结果中找该时间段内有信息量的帧
-        if not matched_frames and keyframes:
-            kp_mid = (kp.get("time_start_sec", 0) + kp.get("time_end_sec", 0)) / 2
-            kp_start = kp.get("time_start_sec", 0)
-            kp_end = kp.get("time_end_sec", 0)
-
-            vr_in_range = [
-                vr for vr in visual_results
-                if kp_start <= vr.get("timestamp", 0) <= kp_end
-                and vr.get("visual_type", "camera") not in SKIP_TYPES
-                and vr.get("index", -1) not in used_frame_indices
-            ]
-            if vr_in_range:
-                priority = {"chart": 0, "ppt": 1, "code": 2, "other": 3}
-                vr_in_range.sort(key=lambda x: priority.get(x.get("visual_type", "other"), 3))
-                for vr in vr_in_range[:2]:
-                    kf = frame_map.get(vr.get("index"))
-                    if kf and kf.get("filename"):
-                        matched_frames.append(kf)
-
-            # 兜底：从已分类的帧中找时间最近的有信息量帧（未用过的）
-            if not matched_frames:
-                all_classified = [
-                    vr for vr in visual_results
-                    if vr.get("visual_type", "camera") not in SKIP_TYPES
-                    and vr.get("index", -1) not in used_frame_indices
-                ]
-                if all_classified:
-                    all_classified.sort(key=lambda x: abs(x.get("timestamp", 0) - kp_mid))
-                    best_vr = all_classified[0]
-                    kf = frame_map.get(best_vr.get("index"))
-                    if kf and kf.get("filename"):
-                        matched_frames.append(kf)
-                # 没有合适的帧就不配图
-
-        for kf in matched_frames[:2]:
-            used_frame_indices.add(kf.get("index", -1))
+        # 配图：用从原视频截取的帧
+        screenshot_fn = kp.get("screenshot_filename", "")
+        if screenshot_fn:
             from urllib.parse import quote
-            img_path = f"/output/{quote(video_name)}/keyframes/{quote(kf['filename'])}"
-            lines.append(f"![帧{kf.get('index', 0)} ({_sec_to_ts(kf.get('timestamp', 0))})]({img_path})\n")
+            img_path = f"/output/{quote(video_name)}/keyframes/{quote(screenshot_fn)}"
+            lines.append(f"![{kp['title'][:30]} ({ts_start})]({img_path})\n")
 
         # 正文内容
         lines.append(f"{kp['content']}\n")
@@ -1016,6 +961,120 @@ def generate_srt(knowledge: dict) -> str:
             lines.append(" | ".join(takeaways[:3]))
         lines.append("")
     return "\n".join(lines)
+
+
+# ── 知识点配图：从原视频截帧 ─────────────────────
+
+async def _extract_kp_screenshots(
+    kp_list: list[dict], video_path: str, output_dir: str, ds_key: str,
+):
+    """
+    为每个知识点从原视频截帧。
+    策略：在知识点时间段内每隔 10 秒截一帧，用 Qwen-VL 快速分类，
+    找到第一个 chart/ppt/code 帧就用，跳过 camera/transition。
+    结果写入 kp["screenshot_path"]。
+    """
+    import subprocess
+
+    kf_dir = os.path.join(output_dir, "keyframes")
+    os.makedirs(kf_dir, exist_ok=True)
+
+    SKIP_TYPES = {"camera", "transition"}
+    sem = asyncio.Semaphore(3)  # 控制 Qwen-VL 并发
+
+    async def classify_image(filepath: str) -> str:
+        """快速分类一张图片，返回 visual_type。"""
+        with open(filepath, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
+        async with sem:
+            async with httpx.AsyncClient(timeout=30) as client:
+                try:
+                    resp = await client.post(
+                        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {ds_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": "qwen-vl-max",
+                            "messages": [{
+                                "role": "user",
+                                "content": [
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                                    {"type": "text", "text": (
+                                        "这张图片属于哪种类型？只回答一个词：\n"
+                                        "ppt / chart / code / camera / transition / other\n"
+                                        "（chart=图表/K线图/股票软件, ppt=幻灯片, code=代码, "
+                                        "camera=人物出镜, transition=OBS/直播软件/场景切换/遮挡）"
+                                    )},
+                                ],
+                            }],
+                            "max_tokens": 20,
+                        },
+                    )
+                    resp.raise_for_status()
+                    vtype = resp.json()["choices"][0]["message"]["content"].strip().lower()
+                    for valid in ("ppt", "chart", "code", "camera", "transition"):
+                        if valid in vtype:
+                            return valid
+                    return "other"
+                except Exception:
+                    return "other"
+
+    async def find_best_frame_for_kp(kp: dict, kp_idx: int):
+        """在知识点时间段内截帧，找到有信息量的就停。"""
+        t_start = kp.get("time_start_sec", 0)
+        t_end = kp.get("time_end_sec", t_start + 60)
+        mid = (t_start + t_end) / 2
+
+        # 从中间开始，向两边扩展，每 10 秒试一次
+        probe_times = [mid]
+        for offset in range(10, int((t_end - t_start) / 2) + 20, 10):
+            probe_times.append(mid + offset)
+            probe_times.append(mid - offset)
+        # 限制在时间段内，去重
+        probe_times = [t for t in probe_times if t_start - 5 <= t <= t_end + 5]
+        probe_times = list(dict.fromkeys(probe_times))[:8]  # 最多试 8 次
+
+        for t in probe_times:
+            fname = f"kp_{kp_idx:03d}_{t:.0f}s.jpg"
+            fpath = os.path.join(kf_dir, fname)
+
+            # ffmpeg 截帧
+            try:
+                proc = await asyncio.to_thread(
+                    subprocess.run,
+                    ["ffmpeg", "-y", "-ss", str(t), "-i", video_path,
+                     "-frames:v", "1", "-q:v", "2", fpath],
+                    capture_output=True, timeout=15,
+                )
+                if proc.returncode != 0 or not os.path.exists(fpath):
+                    continue
+            except Exception:
+                continue
+
+            # 分类
+            vtype = await classify_image(fpath)
+            if vtype not in SKIP_TYPES:
+                kp["screenshot_path"] = fpath
+                kp["screenshot_filename"] = fname
+                log.info("  KP %d: %.0fs → %s (%s)", kp_idx, t, fname, vtype)
+                return
+
+            # 是 camera/transition，删掉继续试
+            try:
+                os.unlink(fpath)
+            except Exception:
+                pass
+
+        log.info("  KP %d: 未找到有信息量的帧", kp_idx)
+
+    # 并发处理所有知识点
+    tasks = [find_best_frame_for_kp(kp, i) for i, kp in enumerate(kp_list)]
+    await asyncio.gather(*tasks)
+
+    found = sum(1 for kp in kp_list if kp.get("screenshot_path"))
+    log.info("知识点配图: %d/%d 个找到有信息量的帧", found, len(kp_list))
 
 
 # ── Main Pipeline ─────────────────────────────────
@@ -1115,7 +1174,25 @@ async def run_ai_pipeline(manifest_path: str, progress_cb=None) -> dict:
                     pass
             errors.append(f"❌ 知识点提取失败: {err_detail}")
 
-    # Step 4: 生成报告 — 如果有错误，在报告开头显示
+    # Step 4: 为每个知识点从原视频截取最佳配图
+    video_path = manifest.get("video_path", "")
+    if not video_path or not os.path.exists(video_path):
+        # manifest 里没有 video_path，从 uploads 目录推算
+        import glob
+        candidates = glob.glob(f"uploads/*/{video_name}.mp4")
+        if candidates:
+            video_path = candidates[0]
+            log.info("从 uploads 找到视频: %s", video_path)
+    kp_list = knowledge.get("knowledge_points", [])
+    if kp_list and video_path and os.path.exists(video_path) and ds_key:
+        if progress_cb:
+            await progress_cb("截取知识点配图", 90)
+        try:
+            await _extract_kp_screenshots(kp_list, video_path, manifest_dir, ds_key)
+        except Exception as e:
+            log.warning("知识点配图截取失败: %s", e)
+
+    # Step 5: 生成报告 — 如果有错误，在报告开头显示
     if progress_cb:
         await progress_cb("生成报告", 95)
 
