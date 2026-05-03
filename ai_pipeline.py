@@ -468,65 +468,24 @@ async def _final_synthesis(
 
     log.info("汇总: %d 块摘要, %d 个知识点", len(chunk_summaries), len(all_points))
 
-    # 如果知识点不多，直接用分块结果组装
-    if len(all_points) <= 30:
-        # 生成摘要和大纲
-        prompt = f"""根据以下视频分段摘要，生成：
-1. 一段 100-200 字的整体摘要
-2. 视频大纲（按时间顺序的章节列表）
+    # 无论知识点多少，都做一轮合并 — 跨块的同主题知识点需要合并
+    points_text = json.dumps(all_points, ensure_ascii=False)
+    # 如果太长，截断（DeepSeek 上下文有限）
+    if len(points_text) > 50000:
+        points_text = points_text[:50000] + "...(已截断)"
 
-## 视频名称
-{video_name}
+    prompt = f"""以下是从视频 "{video_name}" 中按时间分块提取的知识点。
+请完成两件事：
 
-## 分段摘要
-{chr(10).join(summary_lines)}
+### 任务 1：合并知识点
+- 如果多个块讲的是同一个主题（比如连续 3 个块都在讲 MACD），合并成一个完整的知识点
+- 合并时保留最详细的内容，时间范围取最早的 start 和最晚的 end
+- 如果某个知识点只出现在一个块里，保持原样
+- 不要添加素材中没有的信息
 
-用 JSON 格式输出：
-```json
-{{
-  "summary": "整体摘要...",
-  "outline": [{{"title": "章节名", "time_start_sec": 0, "time_end_sec": 300}}]
-}}
-```
-只返回 JSON。"""
-
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                f"{dk_url}/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {dk_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "deepseek-chat",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 4096,
-                    "temperature": 0.3,
-                },
-            )
-            resp.raise_for_status()
-            answer = resp.json()["choices"][0]["message"]["content"]
-
-        try:
-            meta = json.loads(answer.strip().strip("```json").strip("```").strip())
-        except json.JSONDecodeError:
-            meta = {"summary": "", "outline": []}
-
-        return {
-            "summary": meta.get("summary", ""),
-            "outline": meta.get("outline", []),
-            "knowledge_points": all_points,
-        }
-    else:
-        # 知识点太多，让 DeepSeek 合并去重
-        points_text = json.dumps(all_points, ensure_ascii=False)[:30000]
-        prompt = f"""以下是从一段 {video_name} 视频中分块提取的知识点（可能有重复）。
-请合并去重，生成最终的知识笔记。
-
-## 重要约束
-1. 只能使用提供的知识点内容，不要添加新信息
-2. 合并相似的知识点，保留最详细的版本
-3. 时间戳保持原样
+### 任务 2：生成摘要和大纲
+- summary: 100-200 字的整体摘要
+- outline: 按时间顺序的章节列表
 
 ## 分段摘要
 {chr(10).join(summary_lines)}
@@ -537,36 +496,52 @@ async def _final_synthesis(
 用 JSON 格式输出：
 ```json
 {{
-  "summary": "整体摘要（100-200字）",
+  "summary": "整体摘要...",
   "outline": [{{"title": "章节名", "time_start_sec": 0, "time_end_sec": 300}}],
-  "knowledge_points": [...]
+  "knowledge_points": [
+    {{
+      "title": "...",
+      "content": "合并后的详细内容...",
+      "time_start_sec": 0,
+      "time_end_sec": 2700,
+      "importance": "high",
+      "related_frame_indices": [0, 3],
+      "key_takeaways": ["要点1", "要点2"]
+    }}
+  ]
 }}
 ```
 只返回 JSON。"""
 
-        async with httpx.AsyncClient(timeout=300) as client:
-            resp = await client.post(
-                f"{dk_url}/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {dk_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "deepseek-chat",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 16384,
-                    "temperature": 0.3,
-                },
-            )
-            resp.raise_for_status()
-            answer = resp.json()["choices"][0]["message"]["content"]
+    async with httpx.AsyncClient(timeout=180) as client:
+        resp = await client.post(
+            f"{dk_url}/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {dk_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 16384,
+                "temperature": 0.3,
+            },
+        )
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"]
 
-        try:
-            result = json.loads(answer.strip().strip("```json").strip("```").strip())
-        except json.JSONDecodeError:
-            result = {"summary": "", "knowledge_points": all_points[:30], "outline": []}
+    try:
+        result = json.loads(answer.strip().strip("```json").strip("```").strip())
+    except json.JSONDecodeError:
+        log.error("合并结果 JSON 解析失败，使用原始知识点")
+        result = {"summary": "", "outline": [], "knowledge_points": all_points}
 
-        return result
+    # 确保字段完整
+    if not result.get("knowledge_points"):
+        result["knowledge_points"] = all_points
+
+    log.info("合并后: %d → %d 个知识点", len(all_points), len(result["knowledge_points"]))
+    return result
 
 
 async def _single_pass_extract(
