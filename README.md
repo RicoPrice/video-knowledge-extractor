@@ -110,6 +110,8 @@ uvicorn app:app --host 0.0.0.0 --port 7860
 - **前端**: Tailwind CSS + marked.js
 - **存储**: SQLite + 本地文件系统
 
+- **ASR 热词**: DashScope Paraformer 热词表，提升专业术语识别率（配置见 `hotwords.yaml`）
+
 ## 已知限制
 
 - ASR 需要上传音频到 DashScope 云端，大文件上传耗时较长

@@ -1,0 +1,15 @@
+[Unit]
+Description=Video Knowledge Extractor
+After=network.target
+
+[Service]
+Type=simple
+User=rico
+WorkingDirectory=/home/rico/video-knowledge-extractor
+ExecStart=/home/rico/video-knowledge-extractor/venv/bin/uvicorn app:app --host 0.0.0.0 --port 7860
+Restart=always
+RestartSec=3
+Environment=PATH=/home/rico/video-knowledge-extractor/venv/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
