@@ -1,44 +1,40 @@
 # 视频知识点提取平台 Video Knowledge Extractor
 
-超长知识分享直播录播的自动化知识点提取系统。上传视频，自动完成音频转写、画面分析、知识点提取，生成结构化笔记报告。
+上传长视频后，自动完成音频转写、关键帧分析和知识点抽取，输出结构化报告（Markdown / JSON / SRT）。
 
-## 架构
+## 当前架构
 
+```text
+Web App (FastAPI)
+  └─ app.py
+     ├─ 上传视频（SHA-256 去重）
+     ├─ 调用 preprocess.py（子进程）
+     └─ 调用 ai_pipeline.py（异步）
+
+preprocess.py
+  ├─ FFmpeg 提取音频
+  ├─ PySceneDetect 场景检测
+  ├─ pHash 去重 + PPT 启发式过滤
+  └─ 输出 manifest.json
+
+ai_pipeline.py
+  ├─ DashScope Paraformer（ASR）
+  ├─ Qwen-VL-Max（关键帧视觉分析）
+  └─ DeepSeek（知识点汇总与结构化）
 ```
-┌─────────────────────────────────────────────────┐
-│  Web App (FastAPI :7860)                        │
-│  上传视频 → 任务管理 → 报告预览/下载            │
-└──────────┬──────────────────────────────────────┘
-           │
-     ┌─────▼─────┐
-     │ preprocess │  FFmpeg 提取音频
-     │    .py     │  PySceneDetect 场景检测
-     │            │  pHash 去重 + PPT 过滤
-     └─────┬─────┘
-           │ manifest.json
-     ┌─────▼──────────────────────────────────────┐
-     │ ai_pipeline.py                              │
-     │  ① DashScope Paraformer → ASR 语音转写      │
-     │  ② Qwen-VL-Max → 关键帧视觉分析            │
-     │  ③ DeepSeek → 知识点提取 + 结构化输出       │
-     └─────┬──────────────────────────────────────┘
-           │
-     ┌─────▼─────┐
-     │ 多格式输出 │  Markdown / JSON / SRT
-     └───────────┘
-```
+
+## 运行环境
+
+- Linux（推荐 Ubuntu 22.04+）
+- Python 3.10+
+- FFmpeg
+- DashScope API Key（ASR + Qwen-VL）
+- DeepSeek API Key
+- 阿里云 OSS（当前 ASR 路径依赖 OSS 上传音频）
 
 ## 快速开始
 
-### 环境要求
-
-- Ubuntu 22.04+ / DGX Spark
-- Python 3.10+
-- FFmpeg
-- 阿里云百炼 API Key（DashScope）
-- DeepSeek API Key
-
-### 安装
+### 1) 安装依赖
 
 ```bash
 git clone https://github.com/RicoPrice/video-knowledge-extractor.git
@@ -48,72 +44,81 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 配置
+安装 FFmpeg：
+
+```bash
+sudo apt update
+sudo apt install -y ffmpeg
+```
+
+### 2) 配置
 
 ```bash
 cp config.example.yaml config.yaml
 ```
 
-编辑 `config.yaml`，填入：
+至少需要填写：
 
 | 字段 | 说明 | 必填 |
 |------|------|------|
-| `dashscope.api_key` | 阿里云百炼 API Key | ✅ |
-| `deepseek.api_key` | DeepSeek API Key | ✅ |
-| `deepseek.base_url` | DeepSeek API 地址 | 默认 `https://api.deepseek.com` |
-| `oss.*` | 阿里云 OSS 配置 | ❌ 可选 |
+| `dashscope.api_key` | 阿里云百炼 API Key | 是 |
+| `deepseek.api_key` | DeepSeek API Key | 是 |
+| `deepseek.base_url` | DeepSeek API 地址 | 否（默认即可） |
+| `oss.access_key_id` | OSS Access Key ID | 是 |
+| `oss.access_key_secret` | OSS Access Key Secret | 是 |
+| `oss.endpoint` | OSS Endpoint | 是 |
+| `oss.bucket` | OSS Bucket 名称 | 是 |
+| `oss.prefix` | OSS 对象前缀 | 否 |
 
-### 启动
+> 注意：`config.example.yaml` 中有 `dify` 字段，当前主流程未使用 Dify。
+
+### 3) 启动 Web 服务
 
 ```bash
 source venv/bin/activate
 uvicorn app:app --host 0.0.0.0 --port 7860
 ```
 
-浏览器打开 `http://<IP>:7860`，拖拽视频文件上传即可。
+浏览器访问：`http://<服务器IP>:7860`
 
-## 文件说明
+## 主要目录
 
-| 文件 | 说明 |
+| 路径 | 用途 |
 |------|------|
-| `app.py` | FastAPI Web 应用主入口 |
-| `preprocess.py` | 视频预处理（音频提取、场景检测、关键帧去重） |
-| `ai_pipeline.py` | AI 分析流水线（ASR + 视觉分析 + 知识点提取） |
-| `database.py` | SQLite 数据层（任务历史、报告存储） |
-| `config.example.yaml` | 配置模板 |
-| `run.sh` | 命令行一键处理脚本 |
-| `templates/` | Jinja2 前端页面 |
+| `app.py` | FastAPI 主入口，任务编排 |
+| `preprocess.py` | 视频预处理 |
+| `ai_pipeline.py` | AI 分析流水线 |
+| `database.py` | SQLite 数据层 |
+| `templates/` | 前端页面模板 |
+| `static/` | 静态资源 |
+| `uploads/` | 上传视频（按任务ID分目录） |
+| `output/` | 预处理与报告输出 |
+| `data/app.db` | 任务数据库 |
 
 ## 处理流程
 
-1. **上传** — 拖拽视频到 Web 页面，SHA-256 去重检测
-2. **预处理** — FFmpeg 提取音频 → PySceneDetect 场景检测 → pHash 去重 → PPT 帧过滤
-3. **ASR 转写** — 音频上传至 OSS → DashScope Paraformer-v2 语音转文字（带时间戳）
-4. **视觉分析** — Qwen-VL-Max 两轮采样：60 张快速分类 → 按优先级选 30 张详细分析（chart > ppt > code > other，过滤 camera/transition）
-5. **知识点提取** — DeepSeek 分块摘要（15 分钟/块，3 路并发）→ 分组合并同主题 → 生成大纲
-6. **知识点配图** — 从原视频按知识点时间段截帧 → Qwen-VL 分类过滤 camera/OBS 过渡帧 → 只保留有信息量的截图
-7. **报告生成** — Markdown（带截图 + 目录大纲）/ JSON / SRT 多格式输出
+1. 上传视频（Web）并计算 SHA-256 去重。
+2. 预处理：提取音频、场景检测、关键帧去重、PPT 帧标记。
+3. 生成 `manifest.json`。
+4. AI 分析：ASR -> 视觉分析 -> 知识点提取。
+5. 写回数据库并提供报告预览/下载。
 
-### 前端功能
+## 前端能力
 
-- **小窗播放** — 滚动报告时视频自动缩为右下角可拖拽小窗，点击知识点时间戳直接在小窗跳转播放
-- **双 SRT 下载** — "下载 SRT（总结）"为知识点摘要字幕，"下载 SRT（原始字幕）"为 ASR 逐句完整转录
-- **多格式导出** — Markdown / JSON / SRT / 原始字幕 / PDF，一键下载
+- 历史任务列表与轮询刷新
+- 报告页 Markdown 预览/原文/JSON/Manifest 多标签
+- 时间戳点击跳转视频
+- 图片灯箱预览
+- 滚动触发视频小窗（PiP 样式）
+- 下载 `Markdown/JSON/SRT/原始字幕`
+- 浏览器打印导出 PDF
 
-## 技术栈
+## 部署指南
 
-- **后端**: FastAPI + asyncio + aiosqlite
-- **预处理**: FFmpeg + PySceneDetect + OpenCV + imagehash
-- **ASR**: 阿里云百炼 Paraformer-v2
-- **视觉**: Qwen-VL-Max (DashScope)
-- **知识提取**: DeepSeek Chat
-- **前端**: Tailwind CSS + marked.js
-- **存储**: SQLite + 本地文件系统
-
-- **ASR 热词**: DashScope Paraformer 热词表，提升专业术语识别率（配置见 `hotwords.yaml`）
+生产部署（systemd、自启动、日志、排错）见：`DEPLOYMENT.md`
 
 ## 已知限制
 
-- ASR 需要上传音频到 DashScope 云端，大文件上传耗时较长
-- 视觉分析采样 30 帧，超长视频可能遗漏部分画面
-- 单 uvicorn worker，不支持多任务并行处理
+- 当前 ASR 流程依赖 OSS 临时上传音频。
+- 默认单进程运行，长任务会占用较多处理时间。
+- 视觉分析基于采样帧，极长视频可能遗漏部分画面。
