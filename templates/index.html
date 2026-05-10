@@ -17,6 +17,10 @@
   .cat-tag:hover { background: #e0e7ff; }
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; align-items: center; justify-content: center; z-index: 50; }
   .modal-overlay.active { display: flex; }
+  .tab-btn { border-bottom: 2px solid transparent; transition: all .15s; }
+  .tab-btn.active { border-color: #6366f1; color: #4f46e5; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
 </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -26,9 +30,19 @@
   <span class="text-sm text-gray-400">局域网访问</span>
 </nav>
 
-<main class="max-w-4xl mx-auto px-4 py-8">
+<main class="max-w-4xl mx-auto px-4 py-6">
 
-  <section id="upload-section" class="mb-10">
+  <div class="flex items-center gap-1 border-b mb-5">
+    <button class="tab-btn active px-4 py-2 text-sm font-medium text-gray-600" data-tab="history">历史记录 <span id="tab-count" class="ml-1 text-xs text-gray-400"></span></button>
+    <button class="tab-btn px-4 py-2 text-sm font-medium text-gray-600" data-tab="upload">上传视频</button>
+  </div>
+
+  <section id="panel-upload" class="tab-panel">
+    <div class="mb-3 flex items-center gap-2">
+      <label class="text-sm text-gray-600 shrink-0">归入分类：</label>
+      <input id="upload-category-input" type="text" list="upload-category-list" maxlength="40" placeholder="留空=未分类，或输入新分类名" class="flex-1 text-sm px-3 py-1.5 border rounded-lg focus:outline-none focus:border-indigo-400">
+      <datalist id="upload-category-list"></datalist>
+    </div>
     <div id="drop-zone" class="drop-zone border-2 border-dashed border-gray-300 rounded-xl p-10 text-center cursor-pointer hover:border-indigo-400">
       <div class="text-4xl mb-3">📹</div>
       <p class="text-gray-600 mb-2">拖拽视频文件到这里，或点击选择</p>
@@ -47,9 +61,8 @@
     </div>
   </section>
 
-  <section>
-    <div class="flex items-center justify-between mb-3">
-      <h2 class="text-base font-medium text-gray-700">历史记录</h2>
+  <section id="panel-history" class="tab-panel active">
+    <div class="flex items-center justify-between mb-3 gap-2 flex-wrap">
       <div class="flex items-center gap-2">
         <input id="search-input" type="text" placeholder="搜索名称..." class="text-sm px-3 py-1 border rounded-lg focus:outline-none focus:border-indigo-400 w-40">
         <select id="sort-select" class="text-sm px-2 py-1 border rounded-lg focus:outline-none focus:border-indigo-400 bg-white text-gray-700" title="排序">
@@ -59,12 +72,30 @@
           <option value="name_desc">名称 Z→A</option>
           <option value="status">按状态</option>
         </select>
+      </div>
+      <div class="flex items-center gap-2">
         <button id="new-cat-btn" class="text-xs px-3 py-1 border rounded-lg text-gray-600 hover:bg-gray-100" title="新建分类">+ 新建分类</button>
       </div>
     </div>
     <div id="category-bar" class="flex flex-wrap gap-2 mb-4"></div>
     <div id="task-list" class="space-y-3"></div>
     <p id="empty-hint" class="text-gray-400 text-sm hidden mt-2">暂无任务</p>
+    <div id="pagination" class="hidden mt-4 flex items-center justify-between gap-3 text-xs text-gray-500 flex-wrap">
+      <div class="flex items-center gap-3">
+        <span id="page-summary"></span>
+        <select id="page-size-select" class="text-xs px-2 py-1 border rounded-lg focus:outline-none focus:border-indigo-400 bg-white text-gray-600" title="每页显示">
+          <option value="10">每页 10 条</option>
+          <option value="20">每页 20 条</option>
+          <option value="50">每页 50 条</option>
+          <option value="all">全部</option>
+        </select>
+      </div>
+      <div class="flex items-center gap-2">
+        <button id="prev-page" class="px-3 py-1 border rounded-lg hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed">上一页</button>
+        <span id="page-indicator"></span>
+        <button id="next-page" class="px-3 py-1 border rounded-lg hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed">下一页</button>
+      </div>
+    </div>
   </section>
 
 </main>
@@ -92,10 +123,17 @@
 const LS_ACTIVE = 'vke.activeCategory';
 const LS_LOCAL = 'vke.localCategories';
 const LS_SORT = 'vke.sortMode';
+const LS_PAGE_SIZE = 'vke.pageSize';
+const LS_TAB = 'vke.activeTab';
+const LS_UPLOAD_CAT = 'vke.uploadCategory';
 
 let activeCategory = localStorage.getItem(LS_ACTIVE) || '__all__';
 let searchQuery = '';
 let sortMode = localStorage.getItem(LS_SORT) || 'created_desc';
+let pageSize = localStorage.getItem(LS_PAGE_SIZE) || '10';
+let currentPage = 1;
+let activeTab = localStorage.getItem(LS_TAB) || 'history';
+let uploadCategory = localStorage.getItem(LS_UPLOAD_CAT) || '';
 let allTasks = [];
 let serverCategories = [];
 let editingTaskId = null;
@@ -142,8 +180,7 @@ dropZone.addEventListener('drop', e => {
 fileInput.addEventListener('change', () => { if (fileInput.files.length) uploadFile(fileInput.files[0]); });
 
 function currentUploadCategory() {
-  if (activeCategory === '__all__' || activeCategory === '__uncat__') return '';
-  return activeCategory;
+  return (uploadCategory || '').trim();
 }
 
 function updateUploadCatHint() {
@@ -152,8 +189,26 @@ function updateUploadCatHint() {
     uploadCatHint.textContent = `上传后将归入分类：${cat}`;
     uploadCatHint.classList.remove('hidden');
   } else {
-    uploadCatHint.classList.add('hidden');
+    uploadCatHint.textContent = '当前未设置分类，视频将归入「未分类」';
+    uploadCatHint.classList.remove('hidden');
   }
+}
+
+function refreshUploadCategoryDatalist() {
+  const datalist = document.getElementById('upload-category-list');
+  if (!datalist) return;
+  const names = getMergedCategoryList().map(c => c.category);
+  datalist.innerHTML = names.map(n => `<option value="${escapeHtml(n)}"></option>`).join('');
+}
+
+const uploadCategoryInput = document.getElementById('upload-category-input');
+if (uploadCategoryInput) {
+  uploadCategoryInput.value = uploadCategory;
+  uploadCategoryInput.addEventListener('input', e => {
+    uploadCategory = e.target.value;
+    localStorage.setItem(LS_UPLOAD_CAT, uploadCategory);
+    updateUploadCatHint();
+  });
 }
 
 async function uploadFile(file) {
@@ -194,6 +249,8 @@ async function uploadFile(file) {
         uploadPct.textContent = '已提交，开始处理';
       }
       setTimeout(() => { uploadProgress.classList.add('hidden'); }, 3000);
+      currentPage = 1;
+      switchTab('history');
       loadTasks().then(schedulePoll);
     } else {
       uploadPct.textContent = '上传失败';
@@ -409,10 +466,16 @@ function sortTasks(list) {
 }
 
 function renderTasks() {
-  // 正在编辑标题时跳过重绘，避免输入框被 innerHTML 冲掉
   if (editingTaskId) return;
   const list = document.getElementById('task-list');
   const hint = document.getElementById('empty-hint');
+  const pag = document.getElementById('pagination');
+  const pageSummary = document.getElementById('page-summary');
+  const pageIndicator = document.getElementById('page-indicator');
+  const prevBtn = document.getElementById('prev-page');
+  const nextBtn = document.getElementById('next-page');
+  const countEl = document.getElementById('tab-count');
+
   let filtered = allTasks;
   if (activeCategory === '__uncat__') {
     filtered = filtered.filter(t => !t.category);
@@ -423,19 +486,49 @@ function renderTasks() {
     filtered = filtered.filter(t => (t.video_name || '').toLowerCase().includes(searchQuery));
   }
   filtered = sortTasks(filtered);
-  if (filtered.length === 0) {
+  const total = filtered.length;
+  if (countEl) countEl.textContent = total > 0 ? `(${total})` : '';
+
+  if (total === 0) {
     list.innerHTML = '';
     hint.textContent = allTasks.length === 0 ? '暂无任务' : '当前筛选下没有任务';
     hint.classList.remove('hidden');
+    pag.classList.add('hidden');
+    return;
+  }
+
+  hint.classList.add('hidden');
+
+  const size = pageSize === 'all' ? total : parseInt(pageSize, 10) || 10;
+  const totalPages = Math.max(1, Math.ceil(total / size));
+  if (currentPage > totalPages) currentPage = totalPages;
+  if (currentPage < 1) currentPage = 1;
+  const start = (currentPage - 1) * size;
+  const pageItems = filtered.slice(start, start + size);
+
+  list.innerHTML = pageItems.map(taskCard).join('');
+
+  pag.classList.remove('hidden');
+  pageSummary.textContent = `第 ${start + 1}–${start + pageItems.length} 条 / 共 ${total} 条`;
+  if (pageSize === 'all' || totalPages <= 1) {
+    pageIndicator.textContent = '';
+    prevBtn.classList.add('hidden');
+    nextBtn.classList.add('hidden');
+    pageIndicator.classList.add('hidden');
   } else {
-    hint.classList.add('hidden');
-    list.innerHTML = filtered.map(taskCard).join('');
+    pageIndicator.textContent = `${currentPage} / ${totalPages}`;
+    prevBtn.classList.remove('hidden');
+    nextBtn.classList.remove('hidden');
+    pageIndicator.classList.remove('hidden');
+    prevBtn.disabled = currentPage <= 1;
+    nextBtn.disabled = currentPage >= totalPages;
   }
 }
 
 function renderAll() {
   renderCategoryBar();
   renderTasks();
+  refreshUploadCategoryDatalist();
   updateUploadCatHint();
 }
 
@@ -464,6 +557,7 @@ document.getElementById('category-bar').addEventListener('click', e => {
   if (!chip) return;
   activeCategory = chip.dataset.cat;
   localStorage.setItem(LS_ACTIVE, activeCategory);
+  currentPage = 1;
   renderAll();
 });
 
@@ -513,6 +607,7 @@ document.getElementById('task-list').addEventListener('click', async e => {
 
 document.getElementById('search-input').addEventListener('input', e => {
   searchQuery = e.target.value.trim().toLowerCase();
+  currentPage = 1;
   renderTasks();
 });
 
@@ -521,8 +616,43 @@ sortSelect.value = sortMode;
 sortSelect.addEventListener('change', e => {
   sortMode = e.target.value;
   localStorage.setItem(LS_SORT, sortMode);
+  currentPage = 1;
   renderTasks();
 });
+
+const pageSizeSelect = document.getElementById('page-size-select');
+pageSizeSelect.value = pageSize;
+pageSizeSelect.addEventListener('change', e => {
+  pageSize = e.target.value;
+  localStorage.setItem(LS_PAGE_SIZE, pageSize);
+  currentPage = 1;
+  renderTasks();
+});
+
+document.getElementById('prev-page').addEventListener('click', () => {
+  if (currentPage > 1) { currentPage--; renderTasks(); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+});
+document.getElementById('next-page').addEventListener('click', () => {
+  currentPage++;
+  renderTasks();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ── Tabs ──
+function switchTab(name) {
+  activeTab = name === 'upload' ? 'upload' : 'history';
+  localStorage.setItem(LS_TAB, activeTab);
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.tab === activeTab);
+  });
+  document.querySelectorAll('.tab-panel').forEach(panel => {
+    panel.classList.toggle('active', panel.id === 'panel-' + activeTab);
+  });
+}
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+});
+switchTab(activeTab);
 
 // ── 分类模态 ──
 const catModal = document.getElementById('cat-modal');
@@ -596,6 +726,10 @@ catSaveBtn.addEventListener('click', async () => {
     saveLocalCategories();
     activeCategory = val;
     localStorage.setItem(LS_ACTIVE, activeCategory);
+    // 同时把"上传分类"也设成新建的这个，方便直接去上传 tab 提交视频
+    uploadCategory = val;
+    localStorage.setItem(LS_UPLOAD_CAT, uploadCategory);
+    if (uploadCategoryInput) uploadCategoryInput.value = val;
     closeCatModal();
     renderAll();
     return;
