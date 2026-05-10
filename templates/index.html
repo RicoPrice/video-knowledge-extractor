@@ -74,7 +74,24 @@
         </select>
       </div>
       <div class="flex items-center gap-2">
+        <button id="bulk-toggle-btn" class="text-xs px-3 py-1 border rounded-lg text-gray-600 hover:bg-gray-100" title="进入批量选择模式">☐ 批量</button>
         <button id="new-cat-btn" class="text-xs px-3 py-1 border rounded-lg text-gray-600 hover:bg-gray-100" title="新建分类">+ 新建分类</button>
+      </div>
+    </div>
+    <div id="bulk-bar" class="hidden mb-3 px-3 py-2 bg-indigo-50 border border-indigo-200 rounded-lg flex items-center justify-between gap-3 flex-wrap">
+      <div class="flex items-center gap-3 text-sm">
+        <label class="flex items-center gap-1 cursor-pointer select-none">
+          <input id="bulk-select-all" type="checkbox" class="w-4 h-4 accent-indigo-500">
+          <span class="text-gray-600">全选本页</span>
+        </label>
+        <span id="bulk-count" class="text-indigo-700 font-medium">已选 0 项</span>
+      </div>
+      <div class="flex items-center gap-2 flex-wrap">
+        <button data-export="pdf" class="bulk-export-btn px-3 py-1 bg-indigo-500 text-white text-xs rounded-lg hover:bg-indigo-600 disabled:opacity-40 disabled:cursor-not-allowed">导出 PDF</button>
+        <button data-export="md" class="bulk-export-btn px-3 py-1 bg-gray-100 text-gray-700 text-xs rounded-lg hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed">导出 Markdown</button>
+        <button data-export="srt" class="bulk-export-btn px-3 py-1 bg-gray-100 text-gray-700 text-xs rounded-lg hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed">SRT（总结）</button>
+        <button data-export="raw_srt" class="bulk-export-btn px-3 py-1 bg-gray-100 text-gray-700 text-xs rounded-lg hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed">SRT（原始）</button>
+        <button id="bulk-cancel-btn" class="px-3 py-1 text-xs text-gray-500 hover:text-gray-700">取消</button>
       </div>
     </div>
     <div id="category-bar" class="flex flex-wrap gap-2 mb-4"></div>
@@ -138,6 +155,8 @@ let allTasks = [];
 let serverCategories = [];
 let editingTaskId = null;
 let localCategoryNames = new Set();
+let bulkMode = false;
+let bulkSelected = new Set();
 try {
   const saved = JSON.parse(localStorage.getItem(LS_LOCAL) || '[]');
   if (Array.isArray(saved)) saved.forEach(n => n && localCategoryNames.add(n));
@@ -326,9 +345,21 @@ function taskCard(t) {
   const titleHtml = canOpenReport
     ? `<a href="/task/${encodeURIComponent(t.id)}" class="font-medium text-gray-800 hover:text-indigo-600 hover:underline text-sm truncate block" title="查看报告">${escapeHtml(t.video_name)}</a>`
     : `<p class="font-medium text-gray-800 text-sm truncate">${escapeHtml(t.video_name)}</p>`;
+
+  let checkboxCell = '';
+  if (bulkMode) {
+    if (canOpenReport) {
+      const checked = bulkSelected.has(t.id) ? 'checked' : '';
+      checkboxCell = `<input type="checkbox" class="bulk-item-cb w-4 h-4 accent-indigo-500 flex-shrink-0" data-id="${escapeHtml(t.id)}" ${checked}>`;
+    } else {
+      checkboxCell = `<span class="w-4 h-4 flex-shrink-0" title="仅已完成任务可导出"></span>`;
+    }
+  }
+
   return `<div class="bg-white rounded-lg border ${borderCls} p-4 hover:shadow-sm transition-shadow" data-id="${escapeHtml(t.id)}">
     <div class="flex items-center justify-between gap-2">
       <div class="flex items-center gap-3 min-w-0 flex-1">
+        ${checkboxCell}
         <span class="text-lg">🎬</span>
         <div class="min-w-0 flex-1">
           ${titleHtml}
@@ -508,8 +539,7 @@ function renderTasks() {
 
   list.innerHTML = pageItems.map(taskCard).join('');
 
-  pag.classList.remove('hidden');
-  pageSummary.textContent = `第 ${start + 1}–${start + pageItems.length} 条 / 共 ${total} 条`;
+  pag.classList.remove('hidden');  pageSummary.textContent = `第 ${start + 1}–${start + pageItems.length} 条 / 共 ${total} 条`;
   if (pageSize === 'all' || totalPages <= 1) {
     pageIndicator.textContent = '';
     prevBtn.classList.add('hidden');
@@ -523,6 +553,7 @@ function renderTasks() {
     prevBtn.disabled = currentPage <= 1;
     nextBtn.disabled = currentPage >= totalPages;
   }
+  if (bulkMode && typeof updateBulkBar === 'function') updateBulkBar();
 }
 
 function renderAll() {
@@ -653,6 +684,109 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => switchTab(btn.dataset.tab));
 });
 switchTab(activeTab);
+
+// ── 批量导出 ──
+const bulkBar = document.getElementById('bulk-bar');
+const bulkToggleBtn = document.getElementById('bulk-toggle-btn');
+const bulkCancelBtn = document.getElementById('bulk-cancel-btn');
+const bulkCountEl = document.getElementById('bulk-count');
+const bulkSelectAllCb = document.getElementById('bulk-select-all');
+
+function updateBulkBar() {
+  bulkCountEl.textContent = `已选 ${bulkSelected.size} 项`;
+  document.querySelectorAll('.bulk-export-btn').forEach(b => {
+    b.disabled = bulkSelected.size === 0;
+  });
+  // 同步"全选本页"checkbox 的状态
+  const pageCbs = document.querySelectorAll('#task-list .bulk-item-cb');
+  if (pageCbs.length === 0) {
+    bulkSelectAllCb.checked = false;
+    bulkSelectAllCb.indeterminate = false;
+  } else {
+    const total = pageCbs.length;
+    let checked = 0;
+    pageCbs.forEach(cb => { if (cb.checked) checked++; });
+    bulkSelectAllCb.checked = checked === total;
+    bulkSelectAllCb.indeterminate = checked > 0 && checked < total;
+  }
+}
+
+function setBulkMode(on) {
+  bulkMode = on;
+  if (!on) bulkSelected.clear();
+  bulkBar.classList.toggle('hidden', !on);
+  bulkToggleBtn.textContent = on ? '✕ 退出批量' : '☐ 批量';
+  renderTasks();
+  updateBulkBar();
+}
+
+bulkToggleBtn.addEventListener('click', () => setBulkMode(!bulkMode));
+bulkCancelBtn.addEventListener('click', () => setBulkMode(false));
+
+bulkSelectAllCb.addEventListener('change', e => {
+  const on = e.target.checked;
+  document.querySelectorAll('#task-list .bulk-item-cb').forEach(cb => {
+    cb.checked = on;
+    if (on) bulkSelected.add(cb.dataset.id);
+    else bulkSelected.delete(cb.dataset.id);
+  });
+  updateBulkBar();
+});
+
+document.getElementById('task-list').addEventListener('change', e => {
+  if (!e.target.classList.contains('bulk-item-cb')) return;
+  const id = e.target.dataset.id;
+  if (e.target.checked) bulkSelected.add(id);
+  else bulkSelected.delete(id);
+  updateBulkBar();
+});
+
+document.querySelectorAll('.bulk-export-btn').forEach(btn => {
+  btn.addEventListener('click', () => doBulkExport(btn.dataset.export, btn));
+});
+
+async function doBulkExport(fmt, btn) {
+  if (bulkSelected.size === 0) return;
+  const ids = Array.from(bulkSelected);
+  const orig = btn.textContent;
+  document.querySelectorAll('.bulk-export-btn').forEach(b => b.disabled = true);
+  btn.textContent = '打包中...';
+  try {
+    const resp = await fetch('/api/tasks/bulk_export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids, fmt }),
+    });
+    if (!resp.ok) {
+      let msg = String(resp.status);
+      try { const data = await resp.json(); msg = data.error || msg; } catch (_) {}
+      alert('导出失败：' + msg);
+      return;
+    }
+    const blob = await resp.blob();
+    const cd = resp.headers.get('Content-Disposition') || '';
+    const m = /filename\*=UTF-8''([^;]+)/.exec(cd) || /filename="?([^";]+)"?/.exec(cd);
+    const name = m ? decodeURIComponent(m[1]) : `export_${fmt}.zip`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    const skipped = parseInt(resp.headers.get('X-Export-Skipped') || '0', 10);
+    const success = parseInt(resp.headers.get('X-Export-Success') || '0', 10);
+    if (skipped > 0) {
+      alert(`已导出 ${success} 个任务，跳过 ${skipped} 个没有该格式内容的任务`);
+    }
+  } catch (err) {
+    alert('网络错误：' + err.message);
+  } finally {
+    btn.textContent = orig;
+    updateBulkBar();
+  }
+}
 
 // ── 分类模态 ──
 const catModal = document.getElementById('cat-modal');

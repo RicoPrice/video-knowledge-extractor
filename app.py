@@ -17,6 +17,7 @@ from fastapi.templating import Jinja2Templates
 
 import database as db
 import ai_pipeline
+import report_export
 
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -248,6 +249,28 @@ async def api_download(task_id: str, fmt: str):
     task = await db.get_task(task_id)
     if not task:
         return JSONResponse({"error": "not found"}, 404)
+
+    if fmt == "pdf":
+        md_text = task.get("report_markdown") or ""
+        if not md_text:
+            return JSONResponse({"error": "report not available"}, 404)
+        try:
+            pdf_bytes = report_export.render_pdf(
+                md_text,
+                base_dir=OUTPUT_DIR / task.get("video_name", ""),
+                title=task.get("video_name", "报告"),
+            )
+        except Exception as e:
+            return JSONResponse({"error": f"pdf render failed: {e}"}, 500)
+        filename = f"{report_export.safe_filename(task.get('video_name', 'report'))}.pdf"
+        from fastapi.responses import Response
+        from urllib.parse import quote
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+        )
+
     field_map = {"md": "report_markdown", "json": "report_json", "srt": "report_srt", "html": "report_html", "raw_srt": "raw_srt"}
     field = field_map.get(fmt)
     if not field or not task.get(field):
@@ -261,6 +284,50 @@ async def api_download(task_id: str, fmt: str):
     with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(content)
     return FileResponse(tmp_path, filename=filename)
+
+
+@app.post("/api/tasks/bulk_export")
+async def api_bulk_export(payload: dict = Body(...)):
+    """批量导出多个任务的报告，打包为 zip 返回。
+    请求体: { "ids": ["taskid1", ...], "fmt": "pdf" | "md" | "srt" | "raw_srt" }
+    """
+    ids = payload.get("ids") or []
+    fmt = (payload.get("fmt") or "").strip()
+    if not isinstance(ids, list) or not ids:
+        return JSONResponse({"error": "ids is required"}, 400)
+    if fmt not in report_export.FMT_SPEC:
+        return JSONResponse({"error": f"unsupported fmt: {fmt}"}, 400)
+    if len(ids) > 200:
+        return JSONResponse({"error": "too many tasks (max 200)"}, 400)
+
+    tasks: list[dict] = []
+    for tid in ids:
+        t = await db.get_task(tid)
+        if t:
+            tasks.append(t)
+    if not tasks:
+        return JSONResponse({"error": "no valid tasks"}, 404)
+
+    try:
+        zip_bytes, success, skipped = report_export.build_zip(tasks, fmt, OUTPUT_DIR)
+    except Exception as e:
+        return JSONResponse({"error": f"zip build failed: {e}"}, 500)
+
+    if success == 0:
+        return JSONResponse({"error": "所有选中任务都没有可导出的内容", "skipped": skipped}, 404)
+
+    fmt_label = {"pdf": "PDF", "md": "Markdown", "srt": "SRT总结", "raw_srt": "SRT原始字幕"}.get(fmt, fmt)
+    from datetime import datetime
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_name = f"视频报告_{fmt_label}_{stamp}.zip"
+    from fastapi.responses import Response
+    from urllib.parse import quote
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(zip_name)}",
+        "X-Export-Success": str(success),
+        "X-Export-Skipped": str(len(skipped)),
+    }
+    return Response(content=zip_bytes, media_type="application/zip", headers=headers)
 
 
 # ── Background pipeline ──────────────────────────

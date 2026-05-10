@@ -13,3 +13,5 @@ aiofiles==24.1.0
 aiosqlite==0.21.0
 httpx==0.28.1
 dashscope==1.25.17
+markdown==3.10.2
+weasyprint==68.1

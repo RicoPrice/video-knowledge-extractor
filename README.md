@@ -114,8 +114,10 @@ uvicorn app:app --host 0.0.0.0 --port 7860
 - 标题点击直接进入报告页，旁边铅笔按钮内联编辑（回车保存 / Esc 取消）
 - 排序下拉：最新在前 / 最旧在前 / 名称 A→Z / Z→A / 按状态分组，选择持久化到 localStorage
 - 名称模糊搜索
+- 分页：每页 10 / 20 / 50 / 全部，底部分页栏实时显示 `第 X–Y 条 / 共 Z 条` 与翻页按钮
 - 实时进度轮询：有任务进行中时 1.5s 轮询，空闲时 5s；页面切回前台立即刷新
 - 失败任务用红色左边条和醒目"↻ 重试"按钮高亮；已完成可低调"↻ 重新生成"；已取消可"↻ 重新处理"
+- 批量导出：选中模式下为每张卡显示 checkbox，可打包下载 PDF / Markdown / SRT（总结）/ SRT（原始字幕），ZIP 文件不含原始视频
 - 后端重启残留的僵尸任务会被启动时自动标为"后端维护，请重试"
 
 ### 报告详情页
@@ -140,7 +142,8 @@ uvicorn app:app --host 0.0.0.0 --port 7860
 | POST | `/api/tasks/{id}/retry` | 用原视频重新跑一次 pipeline |
 | DELETE | `/api/tasks/{id}` | 删除任务及其上传 / 输出文件 |
 | GET | `/api/categories` | 分类列表及计数 |
-| GET | `/api/tasks/{id}/download/{kind}` | 下载报告（kind: `md` / `json` / `srt` / `raw_srt`） |
+| GET | `/api/tasks/{id}/download/{kind}` | 下载报告（kind: `md` / `json` / `srt` / `raw_srt` / `pdf`） |
+| POST | `/api/tasks/bulk_export` | 批量打包导出 ZIP，body: `{"ids": [...], "fmt": "pdf"\|"md"\|"srt"\|"raw_srt"}` |
 
 ## 部署指南
 
