@@ -1316,4 +1316,4 @@ async def run_ai_pipeline(manifest_path: str, progress_cb=None) -> dict:
     srt = generate_srt(knowledge)
     raw = generate_raw_srt(transcript)
 
-    return {"markdown": md, "json": rj, "srt": srt, "raw_srt": raw}
+    return {"markdown": md, "json": rj, "srt": srt, "raw_srt": raw, "errors": errors}

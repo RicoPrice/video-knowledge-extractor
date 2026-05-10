@@ -9,6 +9,14 @@
   .drop-zone { transition: all .2s; }
   .drop-zone.dragover { border-color: #6366f1; background: #eef2ff; }
   .progress-bar { transition: width .3s ease; }
+  .chip { cursor: pointer; transition: all .15s; user-select: none; }
+  .chip:hover { background: #eef2ff; }
+  .chip.active { background: #6366f1; color: #fff; border-color: #6366f1; }
+  .chip.active:hover { background: #4f46e5; }
+  .cat-tag { cursor: pointer; transition: background .15s; }
+  .cat-tag:hover { background: #e0e7ff; }
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; align-items: center; justify-content: center; z-index: 50; }
+  .modal-overlay.active { display: flex; }
 </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -20,12 +28,12 @@
 
 <main class="max-w-4xl mx-auto px-4 py-8">
 
-  <!-- Upload Section -->
   <section id="upload-section" class="mb-10">
     <div id="drop-zone" class="drop-zone border-2 border-dashed border-gray-300 rounded-xl p-10 text-center cursor-pointer hover:border-indigo-400">
       <div class="text-4xl mb-3">📹</div>
       <p class="text-gray-600 mb-2">拖拽视频文件到这里，或点击选择</p>
       <p class="text-sm text-gray-400">支持 MP4 / MKV / AVI / MOV</p>
+      <p id="upload-cat-hint" class="text-xs text-indigo-500 mt-2 hidden"></p>
       <input id="file-input" type="file" accept="video/*" class="hidden">
     </div>
     <div id="upload-progress" class="hidden mt-4">
@@ -39,23 +47,89 @@
     </div>
   </section>
 
-  <!-- Task List -->
   <section>
-    <h2 class="text-base font-medium text-gray-700 mb-4">历史记录</h2>
-    <div id="task-list" class="space-y-3">
-      <p class="text-gray-400 text-sm" id="empty-hint">暂无任务</p>
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-base font-medium text-gray-700">历史记录</h2>
+      <div class="flex items-center gap-2">
+        <input id="search-input" type="text" placeholder="搜索名称..." class="text-sm px-3 py-1 border rounded-lg focus:outline-none focus:border-indigo-400 w-40">
+        <select id="sort-select" class="text-sm px-2 py-1 border rounded-lg focus:outline-none focus:border-indigo-400 bg-white text-gray-700" title="排序">
+          <option value="created_desc">最新在前</option>
+          <option value="created_asc">最旧在前</option>
+          <option value="name_asc">名称 A→Z</option>
+          <option value="name_desc">名称 Z→A</option>
+          <option value="status">按状态</option>
+        </select>
+        <button id="new-cat-btn" class="text-xs px-3 py-1 border rounded-lg text-gray-600 hover:bg-gray-100" title="新建分类">+ 新建分类</button>
+      </div>
     </div>
+    <div id="category-bar" class="flex flex-wrap gap-2 mb-4"></div>
+    <div id="task-list" class="space-y-3"></div>
+    <p id="empty-hint" class="text-gray-400 text-sm hidden mt-2">暂无任务</p>
   </section>
 
 </main>
 
+<div class="modal-overlay" id="cat-modal" data-mode="">
+  <div class="bg-white rounded-xl p-5 w-80 shadow-xl" onclick="event.stopPropagation()">
+    <h3 class="text-base font-semibold text-gray-800 mb-3" id="cat-modal-title">设置分类</h3>
+    <p class="text-xs text-gray-500 mb-2" id="cat-modal-sub"></p>
+    <div id="cat-suggest" class="flex flex-wrap gap-1.5 mb-3"></div>
+    <input id="cat-input" type="text" maxlength="40" placeholder="输入分类名，留空=未分类" class="w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:border-indigo-400">
+    <div class="flex justify-between items-center gap-2 mt-4">
+      <button id="cat-delete-btn" class="px-3 py-1.5 text-xs text-red-500 hover:bg-red-50 rounded-lg hidden" title="删除此分类（不影响视频）">删除此分类</button>
+      <div class="flex gap-2 ml-auto">
+        <button id="cat-cancel-btn" class="px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-100 rounded-lg">取消</button>
+        <button id="cat-save-btn" class="px-3 py-1.5 text-sm bg-indigo-500 text-white rounded-lg hover:bg-indigo-600">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
+(function() {
+'use strict';
+
+const LS_ACTIVE = 'vke.activeCategory';
+const LS_LOCAL = 'vke.localCategories';
+const LS_SORT = 'vke.sortMode';
+
+let activeCategory = localStorage.getItem(LS_ACTIVE) || '__all__';
+let searchQuery = '';
+let sortMode = localStorage.getItem(LS_SORT) || 'created_desc';
+let allTasks = [];
+let serverCategories = [];
+let editingTaskId = null;
+let localCategoryNames = new Set();
+try {
+  const saved = JSON.parse(localStorage.getItem(LS_LOCAL) || '[]');
+  if (Array.isArray(saved)) saved.forEach(n => n && localCategoryNames.add(n));
+} catch (_) {}
+
+function saveLocalCategories() {
+  localStorage.setItem(LS_LOCAL, JSON.stringify(Array.from(localCategoryNames)));
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function getMergedCategoryList() {
+  const map = new Map();
+  serverCategories.forEach(c => { if (c.category) map.set(c.category, c.count || 0); });
+  localCategoryNames.forEach(n => { if (!map.has(n)) map.set(n, 0); });
+  return Array.from(map.entries())
+    .map(([category, count]) => ({ category, count }))
+    .sort((a, b) => a.category.localeCompare(b.category, 'zh'));
+}
+
+// ── Upload ──
 const dropZone = document.getElementById('drop-zone');
 const fileInput = document.getElementById('file-input');
 const uploadProgress = document.getElementById('upload-progress');
 const uploadBar = document.getElementById('upload-bar');
 const uploadPct = document.getElementById('upload-pct');
 const uploadFilename = document.getElementById('upload-filename');
+const uploadCatHint = document.getElementById('upload-cat-hint');
 
 dropZone.addEventListener('click', () => fileInput.click());
 dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
@@ -67,6 +141,21 @@ dropZone.addEventListener('drop', e => {
 });
 fileInput.addEventListener('change', () => { if (fileInput.files.length) uploadFile(fileInput.files[0]); });
 
+function currentUploadCategory() {
+  if (activeCategory === '__all__' || activeCategory === '__uncat__') return '';
+  return activeCategory;
+}
+
+function updateUploadCatHint() {
+  const cat = currentUploadCategory();
+  if (cat) {
+    uploadCatHint.textContent = `上传后将归入分类：${cat}`;
+    uploadCatHint.classList.remove('hidden');
+  } else {
+    uploadCatHint.classList.add('hidden');
+  }
+}
+
 async function uploadFile(file) {
   uploadFilename.textContent = file.name;
   uploadProgress.classList.remove('hidden');
@@ -75,6 +164,8 @@ async function uploadFile(file) {
 
   const form = new FormData();
   form.append('file', file);
+  const targetCat = currentUploadCategory();
+  if (targetCat) form.append('category', targetCat);
 
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/upload');
@@ -103,7 +194,7 @@ async function uploadFile(file) {
         uploadPct.textContent = '已提交，开始处理';
       }
       setTimeout(() => { uploadProgress.classList.add('hidden'); }, 3000);
-      loadTasks();
+      loadTasks().then(schedulePoll);
     } else {
       uploadPct.textContent = '上传失败';
     }
@@ -112,6 +203,7 @@ async function uploadFile(file) {
   xhr.send(form);
 }
 
+// ── Render ──
 function statusBadge(status) {
   const map = {
     pending: ['等待中', 'bg-gray-100 text-gray-600'],
@@ -124,44 +216,435 @@ function statusBadge(status) {
   return `<span class="px-2 py-0.5 rounded-full text-xs font-medium ${cls}">${label}</span>`;
 }
 
+function categoryTag(t) {
+  const cat = t.category || '';
+  if (cat) {
+    return `<span class="cat-tag inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-indigo-50 text-indigo-700 border border-indigo-100" data-action="edit-cat" data-id="${escapeHtml(t.id)}" data-current="${escapeHtml(cat)}" title="点击修改分类">🏷 ${escapeHtml(cat)}</span>`;
+  }
+  return `<span class="cat-tag inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs text-gray-400 border border-dashed border-gray-300" data-action="edit-cat" data-id="${escapeHtml(t.id)}" data-current="" title="点击设置分类">+ 分类</span>`;
+}
+
 function taskCard(t) {
   const time = new Date(t.created_at).toLocaleString('zh-CN');
-  const progressBar = t.status === 'processing'
-    ? `<div class="mt-2"><div class="flex justify-between text-xs text-gray-500 mb-1"><span>${t.stage || ''}</span><span>${t.progress || 0}%</span></div><div class="w-full bg-gray-200 rounded-full h-1.5"><div class="progress-bar bg-indigo-500 h-1.5 rounded-full" style="width:${t.progress||0}%"></div></div></div>`
+  const isActive = t.status === 'processing' || t.status === 'pending';
+  const progressBar = isActive
+    ? `<div class="mt-2"><div class="flex justify-between text-xs text-gray-500 mb-1"><span>${escapeHtml(t.stage || (t.status === 'pending' ? '等待中' : '处理中'))}</span><span>${t.progress || 0}%</span></div><div class="w-full bg-gray-200 rounded-full h-1.5 overflow-hidden"><div class="progress-bar bg-indigo-500 h-1.5 rounded-full ${(t.progress||0) < 5 ? 'animate-pulse' : ''}" style="width:${Math.max(t.progress||0, 3)}%"></div></div></div>`
     : '';
-  const actions = t.status === 'completed'
-    ? `<div class="mt-2 flex gap-2"><a href="/task/${t.id}" class="text-xs text-indigo-600 hover:underline">查看报告</a><a href="/api/tasks/${t.id}/download/md" class="text-xs text-gray-500 hover:underline">下载 MD</a><a href="/api/tasks/${t.id}/download/json" class="text-xs text-gray-500 hover:underline">JSON</a></div>`
-    : t.status === 'failed'
-    ? `<p class="mt-1 text-xs text-red-500">${t.error || ''}</p>`
+
+  const renameBtn = (t.status !== 'processing' && t.status !== 'pending')
+    ? `<button data-action="rename" data-id="${escapeHtml(t.id)}" data-current="${escapeHtml(t.video_name)}" class="text-xs text-gray-400 hover:text-indigo-600" title="修改标题">✎ 修改标题</button>`
     : '';
-  return `<div class="bg-white rounded-lg border p-4 hover:shadow-sm transition-shadow" data-id="${t.id}">
-    <div class="flex items-center justify-between">
-      <div class="flex items-center gap-3">
-        <span class="text-lg">🎬</span>
-        <div><p class="font-medium text-gray-800 text-sm">${t.video_name}</p><p class="text-xs text-gray-400">${time}</p></div>
+
+  let actions = '';
+  if (t.status === 'completed') {
+    actions = `<div class="mt-2 flex gap-3 items-center">
+      <a href="/task/${encodeURIComponent(t.id)}" class="text-xs text-indigo-600 hover:underline">查看报告</a>
+      <a href="/api/tasks/${encodeURIComponent(t.id)}/download/md" class="text-xs text-gray-500 hover:underline">下载 MD</a>
+      <a href="/api/tasks/${encodeURIComponent(t.id)}/download/json" class="text-xs text-gray-500 hover:underline">JSON</a>
+      <div class="ml-auto flex items-center gap-3">${renameBtn}
+        <button data-action="retry" data-id="${escapeHtml(t.id)}" class="text-xs text-gray-400 hover:text-indigo-600" title="用原视频重新生成报告">↻ 重新生成</button>
       </div>
-      <div class="flex items-center gap-2">${statusBadge(t.status)}<button onclick="deleteTask('${t.id}')" class="text-gray-300 hover:text-red-400 text-sm" title="删除">✕</button></div>
+    </div>`;
+  } else if (t.status === 'failed') {
+    actions = `<div class="mt-3 bg-red-50 border border-red-200 rounded-md px-3 py-2 flex items-start justify-between gap-3">
+      <div class="min-w-0 flex-1">
+        <p class="text-xs font-medium text-red-700 mb-0.5">处理失败</p>
+        <p class="text-xs text-red-600 break-words">${escapeHtml(t.error || '未知错误')}</p>
+      </div>
+      <div class="flex-shrink-0 flex items-center gap-2">${renameBtn}
+        <button data-action="retry" data-id="${escapeHtml(t.id)}" class="px-3 py-1.5 bg-red-500 text-white text-xs rounded-md hover:bg-red-600 font-medium">↻ 重试</button>
+      </div>
+    </div>`;
+  } else if (t.status === 'cancelled') {
+    actions = `<div class="mt-2 flex items-center gap-2">
+      <span class="text-xs text-yellow-700">已取消</span>
+      <div class="ml-auto flex items-center gap-3">${renameBtn}
+        <button data-action="retry" data-id="${escapeHtml(t.id)}" class="text-xs text-indigo-600 hover:underline">↻ 重新处理</button>
+      </div>
+    </div>`;
+  }
+
+  const borderCls = t.status === 'failed' ? 'border-l-4 border-l-red-400' : '';
+  const canOpenReport = t.status === 'completed';
+  const titleHtml = canOpenReport
+    ? `<a href="/task/${encodeURIComponent(t.id)}" class="font-medium text-gray-800 hover:text-indigo-600 hover:underline text-sm truncate block" title="查看报告">${escapeHtml(t.video_name)}</a>`
+    : `<p class="font-medium text-gray-800 text-sm truncate">${escapeHtml(t.video_name)}</p>`;
+  return `<div class="bg-white rounded-lg border ${borderCls} p-4 hover:shadow-sm transition-shadow" data-id="${escapeHtml(t.id)}">
+    <div class="flex items-center justify-between gap-2">
+      <div class="flex items-center gap-3 min-w-0 flex-1">
+        <span class="text-lg">🎬</span>
+        <div class="min-w-0 flex-1">
+          ${titleHtml}
+          <p class="text-xs text-gray-400">${time}</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2 flex-shrink-0">${categoryTag(t)}${statusBadge(t.status)}<button data-action="delete" data-id="${escapeHtml(t.id)}" class="text-gray-300 hover:text-red-400 text-sm" title="删除">✕</button></div>
     </div>${progressBar}${actions}</div>`;
 }
 
-async function loadTasks() {
-  const resp = await fetch('/api/tasks');
-  const tasks = await resp.json();
+function startInlineRename(card, id, current) {
+  // 定位卡片里的标题节点（a 或 p，它是 .font-medium.text-gray-800 的第一个元素）
+  const titleNode = card.querySelector('.font-medium.text-gray-800');
+  if (!titleNode || titleNode.tagName === 'INPUT') return;
+  editingTaskId = id;
+  const originalHtml = titleNode.outerHTML;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = current;
+  input.maxLength = 200;
+  input.className = 'font-medium text-gray-800 text-sm w-full px-2 py-0.5 border border-indigo-400 rounded focus:outline-none focus:ring-1 focus:ring-indigo-300';
+  input.dataset.inlineEdit = '1';
+  titleNode.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let done = false;
+  const restore = (newName) => {
+    if (done) return;
+    done = true;
+    editingTaskId = null;
+    if (newName && newName !== current) {
+      // 本地先更新，重渲染会展现新名字
+      const task = allTasks.find(x => x.id === id);
+      if (task) task.video_name = newName;
+      renderTasks();
+    } else {
+      // 还原原标题 DOM
+      const wrap = document.createElement('div');
+      wrap.innerHTML = originalHtml;
+      input.replaceWith(wrap.firstElementChild);
+    }
+  };
+
+  const save = async () => {
+    const val = input.value.trim();
+    if (!val) { input.focus(); return; }
+    if (val === current) { restore(null); return; }
+    input.disabled = true;
+    try {
+      const resp = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ video_name: val }),
+      });
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        alert('修改失败：' + (data.error || resp.status));
+        input.disabled = false;
+        input.focus();
+        return;
+      }
+      restore(val);
+    } catch (err) {
+      alert('网络错误：' + err.message);
+      input.disabled = false;
+      input.focus();
+    }
+  };
+
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); save(); }
+    else if (e.key === 'Escape') { e.preventDefault(); restore(null); }
+  });
+  input.addEventListener('blur', () => {
+    // 轻微延迟，避免点击"保存"类按钮时被 blur 抢先
+    setTimeout(() => { if (!done) save(); }, 100);
+  });
+}
+
+function renderCategoryBar() {
+  const bar = document.getElementById('category-bar');
+  const totalCount = allTasks.length;
+  const uncatCount = allTasks.filter(t => !t.category).length;
+  const cats = getMergedCategoryList();
+
+  const chip = (key, label, count, active) => {
+    const cls = active ? 'active' : '';
+    return `<span class="chip ${cls} inline-flex items-center gap-1.5 px-3 py-1 border border-gray-200 rounded-full text-xs text-gray-700" data-cat="${escapeHtml(key)}">${escapeHtml(label)} <span class="text-[10px] opacity-75">${count}</span></span>`;
+  };
+
+  let html = chip('__all__', '全部', totalCount, activeCategory === '__all__');
+  if (uncatCount > 0) html += chip('__uncat__', '未分类', uncatCount, activeCategory === '__uncat__');
+  cats.forEach(c => { html += chip(c.category, c.category, c.count, activeCategory === c.category); });
+  bar.innerHTML = html;
+}
+
+function sortTasks(list) {
+  const arr = list.slice();
+  const cmp = (a, b) => {
+    const la = (a || '').toString();
+    const lb = (b || '').toString();
+    return la.localeCompare(lb, 'zh');
+  };
+  const toTs = t => {
+    const v = t.created_at ? Date.parse(t.created_at) : 0;
+    return isNaN(v) ? 0 : v;
+  };
+  // 状态排序时的优先级：处理中 > 等待 > 失败 > 已取消 > 完成
+  const statusRank = { processing: 0, pending: 1, failed: 2, cancelled: 3, completed: 4 };
+  const rankOf = s => (s in statusRank ? statusRank[s] : 99);
+
+  switch (sortMode) {
+    case 'created_asc':
+      arr.sort((a, b) => toTs(a) - toTs(b));
+      break;
+    case 'name_asc':
+      arr.sort((a, b) => cmp(a.video_name, b.video_name));
+      break;
+    case 'name_desc':
+      arr.sort((a, b) => cmp(b.video_name, a.video_name));
+      break;
+    case 'status':
+      arr.sort((a, b) => {
+        const d = rankOf(a.status) - rankOf(b.status);
+        return d !== 0 ? d : toTs(b) - toTs(a);
+      });
+      break;
+    case 'created_desc':
+    default:
+      arr.sort((a, b) => toTs(b) - toTs(a));
+      break;
+  }
+  return arr;
+}
+
+function renderTasks() {
+  // 正在编辑标题时跳过重绘，避免输入框被 innerHTML 冲掉
+  if (editingTaskId) return;
   const list = document.getElementById('task-list');
   const hint = document.getElementById('empty-hint');
-  if (tasks.length === 0) { hint.classList.remove('hidden'); list.innerHTML = ''; list.appendChild(hint); return; }
-  hint.classList.add('hidden');
-  list.innerHTML = tasks.map(taskCard).join('');
+  let filtered = allTasks;
+  if (activeCategory === '__uncat__') {
+    filtered = filtered.filter(t => !t.category);
+  } else if (activeCategory !== '__all__') {
+    filtered = filtered.filter(t => t.category === activeCategory);
+  }
+  if (searchQuery) {
+    filtered = filtered.filter(t => (t.video_name || '').toLowerCase().includes(searchQuery));
+  }
+  filtered = sortTasks(filtered);
+  if (filtered.length === 0) {
+    list.innerHTML = '';
+    hint.textContent = allTasks.length === 0 ? '暂无任务' : '当前筛选下没有任务';
+    hint.classList.remove('hidden');
+  } else {
+    hint.classList.add('hidden');
+    list.innerHTML = filtered.map(taskCard).join('');
+  }
 }
 
-async function deleteTask(id) {
-  if (!confirm('确定删除这个任务？')) return;
-  await fetch(`/api/tasks/${id}`, { method: 'DELETE' });
-  loadTasks();
+function renderAll() {
+  renderCategoryBar();
+  renderTasks();
+  updateUploadCatHint();
 }
 
-loadTasks();
-setInterval(loadTasks, 3000);
+async function loadTasks() {
+  try {
+    const [tResp, cResp] = await Promise.all([
+      fetch('/api/tasks', { cache: 'no-store' }),
+      fetch('/api/categories', { cache: 'no-store' }),
+    ]);
+    if (!tResp.ok || !cResp.ok) throw new Error('bad status');
+    allTasks = await tResp.json();
+    serverCategories = await cResp.json();
+    // 清理 localCategoryNames：若某个本地分类已有任务，服务端会返回它，localSet 里保留没关系
+    // 但若该分类被人为清空了（无任务、localSet 也没有），就不会出现 -> 正常
+    renderAll();
+    return allTasks;
+  } catch (err) {
+    console.warn('loadTasks failed:', err);
+    return allTasks;
+  }
+}
+
+// ── Event delegation ──
+document.getElementById('category-bar').addEventListener('click', e => {
+  const chip = e.target.closest('.chip');
+  if (!chip) return;
+  activeCategory = chip.dataset.cat;
+  localStorage.setItem(LS_ACTIVE, activeCategory);
+  renderAll();
+});
+
+document.getElementById('task-list').addEventListener('click', async e => {
+  const el = e.target.closest('[data-action]');
+  if (!el) return;
+  const action = el.dataset.action;
+  const id = el.dataset.id;
+  if (action === 'delete') {
+    if (!confirm('确定删除这个任务？')) return;
+    try {
+      await fetch(`/api/tasks/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    } catch (_) {}
+    await loadTasks();
+    schedulePoll();
+  } else if (action === 'edit-cat') {
+    openCatModal('edit', { id, current: el.dataset.current || '' });
+  } else if (action === 'rename') {
+    const card = el.closest('.bg-white.rounded-lg.border[data-id]') || el.closest('[data-id]:not(button)');
+    if (!card) return;
+    startInlineRename(card, id, el.dataset.current || '');
+  } else if (action === 'retry') {
+    const task = allTasks.find(t => t.id === id);
+    const isCompleted = task && task.status === 'completed';
+    if (isCompleted && !confirm('该任务已完成。重新生成会覆盖现有报告，确认继续？')) return;
+    el.disabled = true;
+    const orig = el.textContent;
+    el.textContent = '提交中...';
+    try {
+      const resp = await fetch(`/api/tasks/${encodeURIComponent(id)}/retry`, { method: 'POST' });
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        alert('重试失败：' + (data.error || resp.status));
+        el.disabled = false;
+        el.textContent = orig;
+        return;
+      }
+      await loadTasks();
+      schedulePoll();
+    } catch (err) {
+      alert('网络错误：' + err.message);
+      el.disabled = false;
+      el.textContent = orig;
+    }
+  }
+});
+
+document.getElementById('search-input').addEventListener('input', e => {
+  searchQuery = e.target.value.trim().toLowerCase();
+  renderTasks();
+});
+
+const sortSelect = document.getElementById('sort-select');
+sortSelect.value = sortMode;
+sortSelect.addEventListener('change', e => {
+  sortMode = e.target.value;
+  localStorage.setItem(LS_SORT, sortMode);
+  renderTasks();
+});
+
+// ── 分类模态 ──
+const catModal = document.getElementById('cat-modal');
+const catInput = document.getElementById('cat-input');
+const catTitle = document.getElementById('cat-modal-title');
+const catSub = document.getElementById('cat-modal-sub');
+const catSuggest = document.getElementById('cat-suggest');
+const catSaveBtn = document.getElementById('cat-save-btn');
+const catDeleteBtn = document.getElementById('cat-delete-btn');
+const newCatBtn = document.getElementById('new-cat-btn');
+
+let modalState = { mode: '', taskId: null };
+
+function openCatModal(mode, opts) {
+  modalState = { mode, taskId: opts.id || null };
+  if (mode === 'edit') {
+    catTitle.textContent = '设置分类';
+    const task = allTasks.find(t => t.id === opts.id);
+    catSub.textContent = task ? task.video_name : '';
+    catInput.value = opts.current || '';
+    catInput.placeholder = '输入分类名，留空=取消分类';
+    catDeleteBtn.classList.add('hidden');
+  } else {
+    catTitle.textContent = '新建分类';
+    catSub.textContent = '创建后会自动切换到该分类，后续上传的视频将归入其中。';
+    catInput.value = '';
+    catInput.placeholder = '输入新分类名';
+    catDeleteBtn.classList.add('hidden');
+  }
+  const existing = getMergedCategoryList().map(c => c.category);
+  catSuggest.innerHTML = existing.length
+    ? existing.map(n => `<span class="chip inline-flex items-center px-2 py-0.5 border border-gray-200 rounded-full text-xs text-gray-600" data-name="${escapeHtml(n)}">${escapeHtml(n)}</span>`).join('')
+    : '<span class="text-xs text-gray-400">暂无已有分类</span>';
+  catModal.classList.add('active');
+  setTimeout(() => catInput.focus(), 50);
+}
+
+function closeCatModal() {
+  catModal.classList.remove('active');
+  modalState = { mode: '', taskId: null };
+}
+
+catSuggest.addEventListener('click', e => {
+  const chip = e.target.closest('[data-name]');
+  if (!chip) return;
+  catInput.value = chip.dataset.name;
+  catInput.focus();
+});
+
+document.getElementById('cat-cancel-btn').addEventListener('click', closeCatModal);
+
+catModal.addEventListener('click', e => {
+  if (e.target === catModal) closeCatModal();
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && catModal.classList.contains('active')) closeCatModal();
+  if (e.key === 'Enter' && catModal.classList.contains('active')) {
+    e.preventDefault();
+    catSaveBtn.click();
+  }
+});
+
+newCatBtn.addEventListener('click', () => openCatModal('new', {}));
+
+catSaveBtn.addEventListener('click', async () => {
+  const val = catInput.value.trim();
+  if (modalState.mode === 'new') {
+    if (!val) { catInput.focus(); return; }
+    localCategoryNames.add(val);
+    saveLocalCategories();
+    activeCategory = val;
+    localStorage.setItem(LS_ACTIVE, activeCategory);
+    closeCatModal();
+    renderAll();
+    return;
+  }
+  if (modalState.mode === 'edit') {
+    if (!modalState.taskId) return;
+    try {
+      const resp = await fetch(`/api/tasks/${encodeURIComponent(modalState.taskId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ category: val }),
+      });
+      if (!resp.ok) { alert('保存失败'); return; }
+      if (val) {
+        localCategoryNames.add(val);
+        saveLocalCategories();
+      }
+      closeCatModal();
+      loadTasks();
+    } catch (e) {
+      alert('网络错误');
+    }
+  }
+});
+
+// ── 轮询 ──
+let pollTimer = null;
+function schedulePoll() {
+  const hasActive = allTasks.some(t => t.status === 'pending' || t.status === 'processing');
+  const interval = hasActive ? 1500 : 5000;
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(async () => {
+    await loadTasks();
+    schedulePoll();
+  }, interval);
+}
+
+(async () => {
+  await loadTasks();
+  schedulePoll();
+})();
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    loadTasks().then(schedulePoll);
+  }
+});
+
+})();
 </script>
 </body>
 </html>

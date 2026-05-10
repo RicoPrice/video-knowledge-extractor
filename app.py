@@ -10,7 +10,7 @@ from pathlib import Path
 
 import httpx
 import yaml
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile, Body
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -47,6 +47,10 @@ async def startup():
     await db.init_db()
     (BASE_DIR / "static").mkdir(exist_ok=True)
     (BASE_DIR / "templates").mkdir(exist_ok=True)
+    # 清理上次进程未完成的任务：asyncio.Task 不会跨进程保存，重启后这些任务实际上已经丢失
+    stale = await db.mark_stale_as_failed("后端维护，请重试")
+    if stale:
+        print(f"[startup] 清理 {stale} 个因重启中断的任务")
 
 
 # ── Pages ─────────────────────────────────────────
@@ -75,10 +79,47 @@ async def task_detail_page(request: Request, task_id: str):
 
 # ── API ───────────────────────────────────────────
 
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+
 @app.get("/api/tasks")
 async def api_list_tasks():
     tasks = await db.list_tasks()
-    return tasks
+    return JSONResponse(tasks, headers=NO_CACHE_HEADERS)
+
+
+@app.get("/api/categories")
+async def api_list_categories():
+    cats = await db.list_categories()
+    return JSONResponse(cats, headers=NO_CACHE_HEADERS)
+
+
+@app.patch("/api/tasks/{task_id}")
+async def api_update_task(task_id: str, payload: dict = Body(...)):
+    task = await db.get_task(task_id)
+    if not task:
+        return JSONResponse({"error": "not found"}, 404)
+    allowed = {}
+    if "category" in payload:
+        cat = (payload.get("category") or "").strip()
+        if len(cat) > 40:
+            return JSONResponse({"error": "category too long"}, 400)
+        allowed["category"] = cat
+    if "video_name" in payload:
+        name = (payload.get("video_name") or "").strip()
+        if not name:
+            return JSONResponse({"error": "video_name cannot be empty"}, 400)
+        if len(name) > 200:
+            return JSONResponse({"error": "video_name too long"}, 400)
+        allowed["video_name"] = name
+    if not allowed:
+        return JSONResponse({"error": "no valid fields"}, 400)
+    await db.update_task(task_id, **allowed)
+    return JSONResponse({"ok": True, **allowed}, headers=NO_CACHE_HEADERS)
 
 
 @app.get("/api/tasks/{task_id}")
@@ -86,13 +127,14 @@ async def api_get_task(task_id: str):
     task = await db.get_task(task_id)
     if not task:
         return JSONResponse({"error": "not found"}, 404)
-    return task
+    return JSONResponse(task, headers=NO_CACHE_HEADERS)
 
 
 @app.post("/api/upload")
-async def api_upload(file: UploadFile = File(...)):
+async def api_upload(file: UploadFile = File(...), category: str = Form("")):
     if not file.filename:
         return JSONResponse({"error": "no file"}, 400)
+    category = (category or "").strip()[:40]
 
     task_id = uuid.uuid4().hex[:12]
     video_name = Path(file.filename).stem
@@ -140,6 +182,8 @@ async def api_upload(file: UploadFile = File(...)):
             })
 
     await db.create_task(task_id, video_name, str(video_path), file_hash)
+    if category:
+        await db.update_task(task_id, category=category)
     bg = asyncio.create_task(run_pipeline(task_id, str(video_path)))
     _running_tasks[task_id] = bg
     return {"task_id": task_id, "video_name": video_name, "duplicate": False}
@@ -161,6 +205,42 @@ async def api_delete_task(task_id: str):
         shutil.rmtree(output_path)
     await db.delete_task(task_id)
     return {"ok": True}
+
+
+@app.post("/api/tasks/{task_id}/retry")
+async def api_retry_task(task_id: str):
+    task = await db.get_task(task_id)
+    if not task:
+        return JSONResponse({"error": "not found"}, 404)
+    if task["status"] in ("pending", "processing"):
+        return JSONResponse({"error": "task is already running"}, 409)
+    video_path = task.get("video_path") or ""
+    if not video_path or not os.path.exists(video_path):
+        return JSONResponse({"error": "原视频文件已不存在，无法重试"}, 400)
+    # 清理上一轮产出，避免脏数据
+    video_name = task.get("video_name") or task_id
+    out_dir = OUTPUT_DIR / video_name
+    if out_dir.exists():
+        try:
+            shutil.rmtree(out_dir)
+        except Exception:
+            pass
+    await db.update_task(
+        task_id,
+        status="pending",
+        stage="等待重试",
+        progress=0,
+        error="",
+        manifest_json="",
+        report_markdown="",
+        report_json="",
+        report_srt="",
+        report_html="",
+        raw_srt="",
+    )
+    bg = asyncio.create_task(run_pipeline(task_id, video_path))
+    _running_tasks[task_id] = bg
+    return JSONResponse({"ok": True, "task_id": task_id}, headers=NO_CACHE_HEADERS)
 
 
 @app.get("/api/tasks/{task_id}/download/{fmt}")
@@ -252,13 +332,22 @@ async def run_pipeline(task_id: str, video_path: str):
         await db.update_task(task_id, stage="AI 分析中", progress=45)
         result = await ai_pipeline.run_ai_pipeline(manifest_path, progress_cb=progress_cb)
 
+        # 判断是否有致命错误（AI pipeline 做了软失败处理，errors 列表里可能含 ❌ 表示严重错误）
+        pipeline_errors = result.get("errors", []) or []
+        fatal_errors = [e for e in pipeline_errors if isinstance(e, str) and e.startswith("❌")]
+        final_status = "failed" if fatal_errors else "completed"
+        final_stage = "失败" if fatal_errors else "完成"
+        final_progress = 100
+        error_text = "\n".join(fatal_errors)[:1000] if fatal_errors else ""
+
         await db.update_task(
-            task_id, status="completed", stage="完成", progress=100,
+            task_id, status=final_status, stage=final_stage, progress=final_progress,
             report_markdown=result.get("markdown", ""),
             report_json=result.get("json", ""),
             report_srt=result.get("srt", ""),
             raw_srt=result.get("raw_srt", ""),
             report_html="",
+            error=error_text,
         )
     except asyncio.CancelledError:
         await db.update_task(task_id, status="cancelled", stage="已取消")

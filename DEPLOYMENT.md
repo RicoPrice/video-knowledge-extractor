@@ -120,6 +120,11 @@ journalctl -u vke.service -f
 - 核查 `vke.service` 中 `ExecStart` 与 `WorkingDirectory` 是否为实际路径
 - 确认已在该目录创建并安装 `venv`
 
+5) 任务卡在"处理中"不动  
+- 这通常是上次进程被 kill 后留下的僵尸任务
+- 当前版本在服务启动时会自动扫描 `pending / processing` 状态的任务并标记为 `failed`，错误信息 "后端维护，请重试"，用户可直接在任务卡上点 "↻ 重试"
+- 数据库 schema 会在启动时自动迁移（追加 `raw_srt`、`category` 列），无需手工操作
+
 ## 9. 升级流程建议
 
 ```bash
@@ -131,4 +136,4 @@ sudo systemctl restart vke.service
 sudo systemctl status vke.service
 ```
 
-升级后建议上传一个短视频做冒烟验证。
+升级后建议上传一个短视频做冒烟验证。重启期间若有任务正在跑，重启后会被自动标为 `failed`，用户在前端点"重试"即可继续。
